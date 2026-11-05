@@ -20,17 +20,23 @@ dsh-handoff 用 DSH 自己的能力做三件事：
 
 ## 安装
 
+从 GitHub 直装：
+
 ```bash
-dsh plugin --profile <profile> add /path/to/dsh-handoff
+dsh plugin --profile <profile> add github:GarinZ/dsh-handoff
 ```
 
-或者在本仓库目录里：
+从本地检出的源码安装：
 
 ```bash
+dsh plugin --profile <profile> add /path/to/dsh-handoff
+# 或在该目录里
 dsh plugin --profile desktop add .
 ```
 
 宿主半热加载，装完即可用；不需要客户端插件，因此也不用刷新页面。
+
+> 仓库：<https://github.com/GarinZ/dsh-handoff>
 
 ## 使用
 
@@ -64,6 +70,7 @@ Agent 会调用：
 - **来源约束**：subagent 会话不能交接；没有记录 `cwd` 的会话不能交接。
 - **工作目录**：新会话的 `header.cwd` 是目标工作区路径，因此沙箱根、AGENTS.md、skills 发现都跟着走。
 - **损坏保护**：存储迁移先写临时目录、读回校验，再改内存态与账本；任一步失败都会回滚并保留原会话。
+- **`mode: "move"`（beta）**：迁移推迟到当前回合结束（`turn/end`）执行，避免在工具调用中途改写正在写入的日志；工具当时只返回 `queued: true`。如果目标路径与当前工作区相同，则只补写简报、不搬文件。
 
 ## 已知边界
 
