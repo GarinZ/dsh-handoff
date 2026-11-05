@@ -27,6 +27,7 @@ import { realpath, stat } from "node:fs/promises";
 import { relocateSession } from "./lib/relocate.js";
 import { BTW_SYSTEM_PROMPT, buildBriefPrompt, buildInstructionText } from "./lib/prompts.js";
 import { askSideModel, countConversationMessages, resolveRoute, snapshotMessages } from "./lib/side-request.js";
+import { createActivityRoute, createActivityStore } from "./lib/activity.js";
 
 export const name = "dsh-handoff";
 export const inject = ["tools", "agents", "sessions"];
@@ -130,6 +131,12 @@ function workspaceListText(workspaces) {
 
 export function apply(ctx) {
   const log = ctx.logger ?? console;
+  /**
+   * Progress channel for the Client overlay: what each session's side request
+   * is doing right now. The command card is the archive; this is the live view,
+   * so it stays visible while the conversation streams.
+   */
+  const activity = createActivityStore();
 
   /** Resolve the Handoff to the workspace the user named: id, exact title, or directory. */
   const resolveTarget = async (registry, raw) => {
@@ -525,12 +532,13 @@ export function apply(ctx) {
     }
   };
 
-  const scheduleLateResult = (invocation, placeholder, work) => {
+  const scheduleLateResult = (invocation, placeholder, work, hooks = {}) => {
     const commandId = invocation?.commandId;
     const session = invocation?.agent?.session;
     if (commandId === undefined || session === undefined || typeof session.append !== "function") return false;
     const key = String(commandId);
     const controller = new AbortController();
+    hooks.onController?.(controller);
     const record = { commandId, session, sessionId: session.id, settled: false, outcome: undefined, deadline: undefined, controller };
     lateResults.set(key, record);
     // Safety net: if the settlement event never reaches this listener, publish anyway.
@@ -546,7 +554,8 @@ export function apply(ctx) {
       },
       (error) => {
         controller.abort();
-        record.outcome = { kind: "error", text: `${placeholder}失败：${error instanceof Error ? error.message : String(error)}` };
+        const prefix = hooks.failurePrefix ?? `${placeholder}失败`;
+        record.outcome = { kind: "error", text: `${prefix}：${error instanceof Error ? error.message : String(error)}` };
         flushLateResult(key);
       }
     );
@@ -569,16 +578,19 @@ export function apply(ctx) {
     return { llm, session, route, target, messages };
   };
 
-  const executeSideHandoff = async (plan, { agent, sessionId, request, history, signal }) => {
+  const executeSideHandoff = async (plan, { agent, sessionId, request, history, signal, onBriefDelta, onPhase }) => {
     const brief = await askSideModel(plan.llm, {
       provider: plan.route.provider,
       model: plan.route.model,
       messages: [...plan.messages, { role: "user", content: [{ type: "text", text: buildBriefPrompt({ request, history }) }] }],
       sessionId,
       signal,
-      maxTokens: 8192
+      maxTokens: 8192,
+      onDelta: onBriefDelta
     });
-    return await handoffTool.execute({ target: plan.target, summary: brief, history }, { agent, sessionId, signal });
+    onPhase?.("正在创建会话…");
+    const result = await handoffTool.execute({ target: plan.target, summary: brief, history }, { agent, sessionId, signal });
+    return { result, brief };
   };
 
   const describeHandoff = (result, modeText) =>
@@ -613,9 +625,36 @@ export function apply(ctx) {
           const plan = await planSideHandoff({ agent, sessionId, request, history });
           if (plan !== undefined) {
             const placeholder = `正在生成简报并交接（${modeText}）…`;
+            const entry = activity.begin(sessionId, {
+              kind: "handoff",
+              title: `交接简报（${modeText}）`,
+              phase: "正在写简报…",
+              target: plan.target
+            });
             const scheduled = scheduleLateResult(invocation, placeholder, async (lateSignal) => {
-              const result = await executeSideHandoff(plan, { agent, sessionId, request, history, signal: lateSignal });
-              return describeHandoff(result, modeText);
+              try {
+                const { result } = await executeSideHandoff(plan, {
+                  agent,
+                  sessionId,
+                  request,
+                  history,
+                  signal: lateSignal,
+                  onBriefDelta: (text) => activity.update(sessionId, entry.id, { phase: "正在写简报…", text }),
+                  onPhase: (phase) => activity.update(sessionId, entry.id, { phase })
+                });
+                const text = describeHandoff(result, modeText);
+                activity.finish(sessionId, entry.id, "done", { phase: "", text });
+                return text;
+              } catch (error) {
+                activity.finish(sessionId, entry.id, "error", {
+                  phase: "",
+                  text: error instanceof Error ? error.message : String(error)
+                });
+                throw error;
+              }
+            }, {
+              onController: (controller) => activity.track(sessionId, controller),
+              failurePrefix: `交接失败（${modeText}）`
             });
             if (scheduled) return { kind: "success", text: `${placeholder}完成后会更新这条结果。` };
           }
@@ -674,16 +713,32 @@ export function apply(ctx) {
           return { kind: "error", text: "btw: 这次会话还没有请求记录，无法确定用哪个模型。" };
         }
         const placeholder = "旁问中…";
-        const scheduled = scheduleLateResult(invocation, placeholder, (signal) => askSideModel(llm, {
-          provider: route.provider,
-          model: route.model,
-          messages: [
-            ...snapshotMessages(session),
-            { role: "user", content: [{ type: "text", text: `${BTW_SYSTEM_PROMPT}\n\n<question>\n${question}\n</question>` }] }
-          ],
-          sessionId: session.id,
-          signal
-        }));
+        const entry = activity.begin(session.id, { kind: "btw", title: "旁问", question });
+        const scheduled = scheduleLateResult(invocation, placeholder, async (signal) => {
+          try {
+            const answer = await askSideModel(llm, {
+              provider: route.provider,
+              model: route.model,
+              messages: [
+                ...snapshotMessages(session),
+                { role: "user", content: [{ type: "text", text: `${BTW_SYSTEM_PROMPT}\n\n<question>\n${question}\n</question>` }] }
+              ],
+              sessionId: session.id,
+              signal,
+              onDelta: (text) => activity.update(session.id, entry.id, { text })
+            });
+            activity.finish(session.id, entry.id, "done", { text: answer });
+            return answer;
+          } catch (error) {
+            activity.finish(session.id, entry.id, "error", {
+              text: error instanceof Error ? error.message : String(error)
+            });
+            throw error;
+          }
+        }, {
+          onController: (controller) => activity.track(session.id, controller),
+          failurePrefix: "旁问失败"
+        });
         if (!scheduled) {
           // No command id (an adapted caller): answer inline, accepting the wait.
           try {
@@ -706,6 +761,27 @@ export function apply(ctx) {
     })];
   };
 
+  /**
+   * The Client overlay polls this route. It is optional on purpose: a host
+   * without `webServer` (headless, tests) keeps the command cards and loses
+   * only the live panel.
+   */
+  const registerActivityRoute = () => {
+    const registered = [];
+    try {
+      ctx.inject(["webServer"], (child) => {
+        registered.push(child.effect(() => child.webServer.register({
+          kind: "exact",
+          path: "/handoff/activity",
+          handler: createActivityRoute(activity)
+        }), "handoff activity route"));
+      });
+    } catch (error) {
+      log.warn?.(`dsh-handoff: activity route unavailable: ${String(error)}`);
+    }
+    return registered;
+  };
+
   const disposers = [
     ctx.tools.register(handoffTool),
     ...registerCommands(),
@@ -722,9 +798,11 @@ export function apply(ctx) {
       }
     })
   ];
+  disposers.push(...registerActivityRoute());
   disposers.push(() => {
     for (const record of lateResults.values()) record.controller?.abort();
     lateResults.clear();
+    activity.dispose();
   });
   return () => {
     for (const disposer of disposers) {

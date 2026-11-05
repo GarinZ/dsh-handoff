@@ -1,16 +1,18 @@
 {
   "name": "@garinz/dsh-handoff",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Model-facing handoff for DeepSeek Harness: hand this session off to a session inside another workspace, with two history policies — full copy (fork the complete event history) or summary only (start a blank session from the written brief). dsh-handoff：把当前会话交接到另一个工作区的新会话里，可选「完整复制历史」或「只写总结不复制历史」；由 Agent 在对话中自行调用。",
   "type": "module",
   "main": "./index.js",
   "exports": {
     ".": "./index.js",
+    "./client": "./client.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "files": [
     "index.js",
+    "client.js",
     "lib",
     "cordis.patch.yml",
     "README.md",
@@ -23,6 +25,14 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ]
     }
   },
   "keywords": [
