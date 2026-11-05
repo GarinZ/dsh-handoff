@@ -83,6 +83,14 @@ Agent 会调用：
 - 开发与验证环境：DSH `0.2.2-rc.1`（macOS 桌面版），Node 24。
 - 需要 hosting 暴露 `sessionController`、`workspaceRegistry`、`sessionPersistence` 三个服务（官方 `dsh-base` 都有）。
 
+## 开发与测试
+
+```bash
+node --test test/relocate.test.mjs
+```
+
+覆盖存储布局编码（`projectKey` / `encodeSegment`）、头部帧重写、事件帧逐字节保留、重复目标拒绝、同目录 no-op。
+
 ## 许可与致谢
 
 MIT。`lib/relocate.js` 改编自 [dsh-cd](https://github.com/john-walks-slow/dsh-cd)（MIT）的 `dist/relocate.js`；会话存储布局的编码规则（`projectKey` / `encodeSegment`）取自 DSH 的 JSONL 持久化后端，同一份代码也出现在 [dsh-session-manager](https://github.com/hkkz9522/dsh-session-manager)（MIT）中。
