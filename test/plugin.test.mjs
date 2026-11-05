@@ -246,3 +246,22 @@ test("/btw remembers earlier side answers so a follow-up can build on them", asy
   assert.ok(prompt.includes("第一问的答案。"));
   assert.ok(prompt.includes("<question>\n那第二步呢？"));
 });
+
+test("side answers reach a follow-up in full, not clipped", async () => {
+  const long = "长答案".repeat(2000);
+  const llm = fakeLlm(long);
+  const host = makeHost({ llm });
+  apply(host.ctx);
+  const btw = findCommand(host.commands, "btw");
+  const session = fakeSession({ append: () => ({}) });
+  const agent = { id: "session-abc", session };
+
+  await btw.handler({ agent, rawInput: "第一问", commandId: "cmd-1", signal: undefined });
+  await settle();
+  host.emit(session, { type: "command/done", data: { commandId: "cmd-1", kind: "success", text: "占位" } });
+  await btw.handler({ agent, rawInput: "追问", commandId: "cmd-2", signal: undefined });
+
+  const prompt = llm.calls.at(-1).messages[0].content[0].text;
+  assert.ok(prompt.includes(long), "the earlier answer is carried verbatim");
+  assert.ok(!prompt.includes("…\n"), "no ellipsis marker");
+});
