@@ -115,6 +115,25 @@ test("the full command requests a full copy and lets the model pick the target",
   assert.ok(text.includes("~/work/another-repo"));
 });
 
+test("the fast path accepts a destination that does not exist yet", async () => {
+  const llm = fakeLlm("## 目标\n- 冒烟测试");
+  const host = makeHost({ llm, workspaceRegistry: { list: () => [] } });
+  apply(host.ctx);
+  const command = findCommand(host.commands, "handoff-summary");
+  const session = fakeSession({ append: () => ({}) });
+  const target = `/tmp/handoff-fast-path-${process.pid}/nested`;
+  const result = await command.handler({
+    agent: { id: "session-abc", session },
+    rawInput: `交接给 ${target}，重点写冒烟测试`,
+    commandId: "cmd-fast",
+    signal: undefined
+  });
+
+  assert.equal(result.kind, "success");
+  assert.ok(result.text.startsWith("正在生成简报并交接"), "the side request must not wait inside the handler");
+  assert.equal(host.prompts.length, 0, "a resolvable target must not fall back to a model turn");
+});
+
 test("an empty command falls back to asking the model to choose a target", async () => {
   const host = makeHost();
   apply(host.ctx);

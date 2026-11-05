@@ -23,7 +23,7 @@
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
-import { realpath, stat } from "node:fs/promises";
+import { mkdir, realpath, stat } from "node:fs/promises";
 import { relocateSession } from "./lib/relocate.js";
 import { BTW_SYSTEM_PROMPT, buildBriefPrompt, buildInstructionText, buildSideThread } from "./lib/prompts.js";
 import {
@@ -163,11 +163,23 @@ export function apply(ctx) {
     const byTitle = workspaces.find((workspace) => String(workspace.title ?? "").toLowerCase() === raw.toLowerCase());
     if (byTitle !== undefined) return { workspace: byTitle, created: false };
 
-    const directory = await resolveDirectory(expandHomePath(raw));
+    let directory = await resolveDirectory(expandHomePath(raw));
+    if (directory === undefined) {
+      // Naming a directory that does not exist yet is a normal way to open a
+      // fresh workspace ("hand off to ~/proj/new-thing"): create it, then
+      // resolve again so the ledger gets the real path.
+      const candidate = expandHomePath(raw);
+      try {
+        await mkdir(candidate, { recursive: true });
+        directory = await resolveDirectory(candidate);
+      } catch {
+        directory = undefined;
+      }
+    }
     if (directory === undefined) {
       throw new Error(
-        `handoff: "${raw}" is neither a registered workspace nor an existing directory.\n` +
-        `Pass an absolute path that exists, or one of these workspaces:\n${workspaceListText(workspaces)}`
+        `handoff: "${raw}" is neither a registered workspace, an existing directory, nor a path that could be created.\n` +
+        `Pass an absolute path, or one of these workspaces:\n${workspaceListText(workspaces)}`
       );
     }
     const existing = await registry.resolveByPath(directory).catch(() => undefined);
@@ -187,6 +199,11 @@ export function apply(ctx) {
     if (pathMatch !== null) {
       const candidate = pathMatch[1].replace(/[.,;:!?。，；：！？]+$/u, "");
       if ((await resolveDirectory(expandHomePath(candidate))) !== undefined) return candidate;
+      // A path that does not exist yet is still a valid destination: the tool
+      // creates the directory. Require at least two segments so that a mere
+      // "/command" mention in the prompt is not mistaken for a workspace.
+      const segments = candidate.split("/").filter((segment) => segment.length > 0);
+      if (segments.length >= 2) return candidate;
     }
     const workspaces = registry.list();
     const folded = request.toLowerCase();

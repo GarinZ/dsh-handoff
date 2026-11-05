@@ -41,12 +41,16 @@ window.__ModuleLoader__.load({
 
     const POLL_MS = 700
     const POLL_TIMEOUT_MS = 600_000
+    // The host writes the activity slot inside the command handler, which may
+    // land a tick after `command/executed`. A single "idle" answer must not
+    // close the card: without this grace window the card depends on a race.
+    const IDLE_GRACE_MS = 5000
     const STORAGE_KEY = 'dsh-handoff:activity-session'
     const COMMANDS = new Set(['btw', 'handoff', 'handoff-summary'])
 
     /** Panel state. Shared with the component through useSyncExternalStore. */
     const store = {
-      state: { sessionId: '', activity: null, open: false },
+      state: { sessionId: '', activity: null, open: false, awaitingSince: 0, knownId: '' },
       listeners: new Set(),
       get() {
         return store.state
@@ -74,11 +78,22 @@ window.__ModuleLoader__.load({
           .then((response) => (response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`))))
           .then((activity) => {
             if (generation !== pollGeneration || store.state.sessionId !== sessionId) return
-            if (!activity || activity.status === 'idle') {
-              if (store.state.activity?.status === 'running') store.set({ activity: null, open: false })
-              return
+            const waiting = store.state.awaitingSince === 0 ? Infinity : Date.now() - store.state.awaitingSince
+            const empty = !activity || activity.status === 'idle'
+            // The slot still holds the previous request while the new one starts:
+            // keep waiting for a different id, but never past the grace window.
+            const settledSame = !empty && activity.id === store.state.knownId && activity.status !== 'running'
+            if (empty || (settledSame && waiting < IDLE_GRACE_MS)) {
+              if (waiting < IDLE_GRACE_MS) {
+                if (Date.now() - started < POLL_TIMEOUT_MS) setTimeout(tick, POLL_MS)
+                return
+              }
+              if (empty) {
+                if (store.state.activity?.status === 'running') store.set({ activity: null, open: false })
+                return
+              }
             }
-            store.set({ activity, open: true })
+            store.set({ activity, open: true, awaitingSince: 0, knownId: activity.id })
             if (activity.status === 'running' && Date.now() - started < POLL_TIMEOUT_MS) setTimeout(tick, POLL_MS)
           })
           .catch(() => {
@@ -268,14 +283,19 @@ window.__ModuleLoader__.load({
         }, 'handoff activity styles')
 
         // Sit above the composer, in the same overlay slot the BTW plugins use.
+        // `slots.inject` (not a bare `ctx.inject`) is what binds the occupant to
+        // the slot's lifecycle: market plugins register exactly this way.
         try {
-          ctx.inject(['slots'], (scope) => {
-            scope.effect(() => scope.slots.register({
-              name: 'conversation.input.overlay',
-              id: 'handoff:activity',
-              order: 12
-            }, ActivityCard))
-          })
+          const registerCard = (slots) => slots.register({
+            name: 'conversation.input.overlay',
+            id: 'handoff:activity',
+            order: 12
+          }, ActivityCard)
+          if (typeof ctx.slots?.inject === 'function') {
+            ctx.slots.inject('conversation.input.overlay', () => registerCard(ctx.slots))
+          } else {
+            ctx.inject(['slots'], (scope) => scope.effect(() => registerCard(scope.slots)))
+          }
         } catch {
           // No slots service: the command cards still report everything.
         }
@@ -286,7 +306,13 @@ window.__ModuleLoader__.load({
           ctx.on('command/executed', (sessionId, name) => {
             if (!COMMANDS.has(name) || !sessionId) return
             try { localStorage.setItem(STORAGE_KEY, sessionId) } catch { /* private mode */ }
-            store.set({ sessionId, open: true, activity: store.state.sessionId === sessionId ? store.state.activity : null })
+            store.set({
+              sessionId,
+              open: true,
+              activity: null,
+              knownId: store.state.sessionId === sessionId ? store.state.activity?.id ?? store.state.knownId : '',
+              awaitingSince: Date.now()
+            })
             poll(sessionId)
           })
         } catch {

@@ -62,13 +62,16 @@ test("apply registers the card in the composer overlay slot and listens for our 
   const { apply } = module.factory(require_);
 
   const registered = [];
+  const injected = [];
   const listeners = new Map();
   const effects = [];
   const style = { textContent: "", remove() { this.removed = true } };
 
   const slots = {
     inject(name, factory) {
-      registered.push({ name, factory });
+      // The real service runs the factory and keeps its disposer.
+      const dispose = factory();
+      injected.push({ name, dispose });
       return () => {};
     },
     register(options, Component) {
@@ -77,6 +80,7 @@ test("apply registers the card in the composer overlay slot and listens for our 
     }
   };
   const ctx = {
+    slots,
     effect(factory, label) {
       const cleanup = factory();
       effects.push({ label, cleanup });
@@ -109,6 +113,7 @@ test("apply registers the card in the composer overlay slot and listens for our 
     apply(ctx);
     assert.ok(effects.some((effect) => effect.label === "handoff activity styles"));
 
+    assert.deepEqual(injected.map((entry) => entry.name), ["conversation.input.overlay"]);
     const overlay = registered.find((entry) => entry.options?.name === "conversation.input.overlay");
     assert.equal(overlay?.options.id, "handoff:activity");
     assert.equal(typeof overlay.Component, "function");
