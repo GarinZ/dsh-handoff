@@ -1,0 +1,5 @@
+# dsh-handoff bundle 层：插入 handoff 插件行。
+- insert:
+    - id: dsh-handoff
+      name: 'dsh-handoff'
+      config: {}

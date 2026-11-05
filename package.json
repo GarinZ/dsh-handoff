@@ -1,0 +1,43 @@
+{
+  "name": "dsh-handoff",
+  "version": "0.1.0",
+  "description": "Model-facing handoff for DeepSeek Harness: copy this session's full history into a new session inside another workspace and open it with a written handoff brief. dsh-handoff：把当前会话完整复制到另一个工作区的新会话里，并附一份交接简报；由 Agent 在对话中自行调用。",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "handoff",
+    "session",
+    "workspace",
+    "fork",
+    "context",
+    "交接",
+    "工作区",
+    "会话复制"
+  ],
+  "author": "garin",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.15"
+  }
+}
