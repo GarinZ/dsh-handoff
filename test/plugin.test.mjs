@@ -10,10 +10,11 @@ const makeHost = (services = {}) => {
   const tools = [];
   const commands = [];
   const prompts = [];
+  const listeners = [];
   const ctx = {
     logger: { warn() {}, info() {}, error() {} },
     tools: { register: (tool) => { tools.push(tool); return () => {}; } },
-    on: () => () => {},
+    on: (eventName, listener) => { if (eventName === "session/event") listeners.push(listener); return () => {}; },
     get: (key, fallback) => {
       if (key === "commands") {
         return { register: (definition) => { commands.push(definition); return () => {}; } };
@@ -23,8 +24,14 @@ const makeHost = (services = {}) => {
       return fallback;
     }
   };
-  return { ctx, tools, commands, prompts };
+  const emit = (session, event) => {
+    for (const listener of listeners) listener(session, event);
+  };
+  return { ctx, tools, commands, prompts, emit };
 };
+
+/** Let the scheduled side request settle before the test inspects the result. */
+const settle = () => new Promise((resolve) => setImmediate(resolve));
 
 const findCommand = (commands, commandName) => {
   const found = commands.find((command) => command.name === commandName);
@@ -128,16 +135,18 @@ test("a missing session controller is reported instead of thrown", async () => {
   assert.ok(result.text.includes("会话控制器不可用"));
 });
 
-test("/btw answers over a snapshot and returns the text without prompting the agent", async () => {
+test("/btw answers over a snapshot without prompting the agent", async () => {
   const llm = fakeLlm("这个仓库用的是 MIT 许可证。");
   const host = makeHost({ llm });
   apply(host.ctx);
   const btw = findCommand(host.commands, "btw");
-  const agent = { id: "session-abc", session: fakeSession() };
-  const result = await btw.handler({ agent, rawInput: "这个仓库用什么许可证？", signal: undefined });
+  const appended = [];
+  const session = fakeSession({ append: (type, data) => { appended.push({ type, data }); return { type, data }; } });
+  const agent = { id: "session-abc", session };
+  const result = await btw.handler({ agent, rawInput: "这个仓库用什么许可证？", commandId: "cmd-1", signal: undefined });
 
   assert.equal(result.kind, "success");
-  assert.equal(result.text, "这个仓库用的是 MIT 许可证。");
+  assert.ok(result.text.startsWith("旁问中"), "the handler must return at once so the composer clears");
   assert.equal(host.prompts.length, 0, "no agent turn may be queued");
   assert.equal(llm.calls.length, 1);
   const [call] = llm.calls;
@@ -148,6 +157,15 @@ test("/btw answers over a snapshot and returns the text without prompting the ag
   assert.equal(last.role, "user");
   assert.ok(last.content[0].text.includes("这个仓库用什么许可证？"));
   assert.ok(call.messages.some((message) => message.role === "system"), "the session system prompt is forwarded");
+
+  // The executor settles first; the answer then replaces the placeholder node.
+  await settle();
+  host.emit(session, { type: "command/done", data: { commandId: "cmd-1", kind: "success", text: result.text } });
+  const late = appended.at(-1);
+  assert.equal(late.type, "command/done");
+  assert.equal(late.data.commandId, "cmd-1");
+  assert.equal(late.data.kind, "success");
+  assert.equal(late.data.text, "这个仓库用的是 MIT 许可证。");
 });
 
 test("/btw without the llm service reports an error", async () => {
@@ -168,4 +186,36 @@ test("/btw with an empty question returns usage", async () => {
   const result = await findCommand(host.commands, "btw").handler({ agent: { id: "s", session: fakeSession() }, rawInput: "  ", signal: undefined });
   assert.equal(result.kind, "error");
   assert.ok(result.text.includes("用法"));
+});
+
+test("the handoff command returns at once and reports the background failure later", async () => {
+  const llm = fakeLlm("## 目标\nbrief");
+  const host = makeHost({
+    llm,
+    workspaceRegistry: { list: () => [], create: async () => { throw new Error("没有可用的工作区工厂"); } },
+    sessionController: { prompt: async () => { throw new Error("the model path must not run"); } }
+  });
+  apply(host.ctx);
+  const appended = [];
+  const session = fakeSession({ append: (type, data) => { appended.push({ type, data }); return { type, data }; } });
+  const command = findCommand(host.commands, "handoff");
+  const result = await command.handler({
+    agent: { id: "session-abc", session },
+    rawInput: "交接给 /tmp，重点写测试",
+    commandId: "cmd-2",
+    signal: undefined
+  });
+
+  assert.equal(result.kind, "success");
+  assert.ok(result.text.startsWith("正在生成简报并交接"), "the handler must return before the side request finishes");
+  assert.equal(host.prompts.length, 0, "the fast path must not queue a model turn");
+
+  host.emit(session, { type: "command/done", data: { commandId: "cmd-2", kind: "success", text: result.text } });
+  const deadline = Date.now() + 2_000;
+  while (appended.length === 0 && Date.now() < deadline) await settle();
+  const late = appended.at(-1);
+  assert.equal(late?.type, "command/done");
+  assert.equal(late.data.commandId, "cmd-2");
+  assert.equal(late.data.kind, "error");
+  assert.ok(late.data.text.length > 0, "the failure must be reported in the command node");
 });

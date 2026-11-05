@@ -488,8 +488,73 @@ export function apply(ctx) {
     try { return ctx.get(key, false); } catch { return undefined; }
   };
 
-  /** Returns the tool result, or `undefined` when the side path cannot run. */
-  const runSideHandoff = async ({ agent, sessionId, request, history, signal }) => {
+  /**
+   * Late command results.
+   *
+   * A command handler runs inside the client's submit transaction: the composer
+   * keeps the draft and stays busy until the handler settles. A side request
+   * takes seconds (it uploads the whole conversation), so awaiting one inside a
+   * handler freezes the input box for that long. Instead the handler returns a
+   * placeholder at once, the composer clears, and the answer is delivered later
+   * by appending a second `command/done` for the same command id — the client's
+   * command node is keyed by that id, so the flow node updates in place.
+   *
+   * The append must follow the executor's own settlement event, otherwise that
+   * event would overwrite the answer with the placeholder.
+   */
+  const lateResults = new Map();
+
+  const flushLateResult = (key) => {
+    const record = lateResults.get(key);
+    if (record === undefined || !record.settled || record.outcome === undefined) return;
+    lateResults.delete(key);
+    clearTimeout(record.deadline);
+    const session = record.session;
+    if (session === undefined || typeof session.append !== "function") {
+      log.warn?.(`dsh-handoff: late result for command ${record.commandId} lost its session`);
+      return;
+    }
+    try {
+      session.append("command/done", {
+        commandId: record.commandId,
+        kind: record.outcome.kind,
+        text: record.outcome.text
+      });
+    } catch (error) {
+      log.warn?.(`dsh-handoff: could not publish the late command result: ${String(error)}`);
+    }
+  };
+
+  const scheduleLateResult = (invocation, placeholder, work) => {
+    const commandId = invocation?.commandId;
+    const session = invocation?.agent?.session;
+    if (commandId === undefined || session === undefined || typeof session.append !== "function") return false;
+    const key = String(commandId);
+    const controller = new AbortController();
+    const record = { commandId, session, sessionId: session.id, settled: false, outcome: undefined, deadline: undefined, controller };
+    lateResults.set(key, record);
+    // Safety net: if the settlement event never reaches this listener, publish anyway.
+    record.deadline = setTimeout(() => {
+      record.settled = true;
+      flushLateResult(key);
+    }, 10_000);
+    record.deadline.unref?.();
+    work(controller.signal).then(
+      (text) => {
+        record.outcome = { kind: "success", text: String(text) };
+        flushLateResult(key);
+      },
+      (error) => {
+        controller.abort();
+        record.outcome = { kind: "error", text: `${placeholder}失败：${error instanceof Error ? error.message : String(error)}` };
+        flushLateResult(key);
+      }
+    );
+    return true;
+  };
+
+  /** Cheap checks only: everything here must stay fast enough to run before returning. */
+  const planSideHandoff = async ({ agent, sessionId, request, history }) => {
     const registry = getService("workspaceRegistry");
     const llm = getService("llm");
     if (registry === undefined || llm === undefined || typeof llm.stream !== "function") return undefined;
@@ -501,17 +566,25 @@ export function apply(ctx) {
     if (target === undefined) return undefined;
     const messages = snapshotMessages(session);
     if (countConversationMessages(messages) < 2) return undefined;
+    return { llm, session, route, target, messages };
+  };
 
-    const brief = await askSideModel(llm, {
-      provider: route.provider,
-      model: route.model,
-      messages: [...messages, { role: "user", content: [{ type: "text", text: buildBriefPrompt({ request, history }) }] }],
+  const executeSideHandoff = async (plan, { agent, sessionId, request, history, signal }) => {
+    const brief = await askSideModel(plan.llm, {
+      provider: plan.route.provider,
+      model: plan.route.model,
+      messages: [...plan.messages, { role: "user", content: [{ type: "text", text: buildBriefPrompt({ request, history }) }] }],
       sessionId,
       signal,
       maxTokens: 8192
     });
-    return await handoffTool.execute({ target, summary: brief, history }, { agent, sessionId, signal });
+    return await handoffTool.execute({ target: plan.target, summary: brief, history }, { agent, sessionId, signal });
   };
+
+  const describeHandoff = (result, modeText) =>
+    `已交接（${modeText}）：会话 ${result.sessionId} 位于工作区「${result.workspaceTitle}」(${result.workspacePath})` +
+    (result.workspaceCreated === true ? "（新工作区）" : "") +
+    "。原会话保持不变。";
 
   const registerCommands = () => {
     const commands = (() => {
@@ -526,7 +599,8 @@ export function apply(ctx) {
         description:
           `交接当前会话（${modeText}）到另一个工作区：用自然语言说明去哪、简报重点写什么`,
         input: { hint: "<自然语言：交接去哪里、简报重点>" },
-        async handler({ agent, rawInput, signal }) {
+        async handler(invocation) {
+          const { agent, rawInput, signal } = invocation;
           const request = String(rawInput ?? "").trim();
           const sessionId = agent?.session?.id ?? agent?.id;
           const controller = getService("sessionController");
@@ -534,20 +608,16 @@ export function apply(ctx) {
             return { kind: "error", text: "handoff: 会话控制器不可用，无法发起交接。" };
           }
 
-          let result;
-          try {
-            result = await runSideHandoff({ agent, sessionId, request, history, signal });
-          } catch (error) {
-            log.warn?.(`dsh-handoff: side-request handoff failed, asking the model instead: ${String(error)}`);
-          }
-          if (result !== undefined) {
-            return {
-              kind: "success",
-              text:
-                `已交接（${modeText}）：会话 ${result.sessionId} 位于工作区「${result.workspaceTitle}」(${result.workspacePath})` +
-                (result.workspaceCreated === true ? "（新工作区）" : "") +
-                `。原会话保持不变。`
-            };
+          // The side request uploads the whole conversation, so it must not run
+          // inside the handler: the composer would hold the draft until it lands.
+          const plan = await planSideHandoff({ agent, sessionId, request, history });
+          if (plan !== undefined) {
+            const placeholder = `正在生成简报并交接（${modeText}）…`;
+            const scheduled = scheduleLateResult(invocation, placeholder, async (lateSignal) => {
+              const result = await executeSideHandoff(plan, { agent, sessionId, request, history, signal: lateSignal });
+              return describeHandoff(result, modeText);
+            });
+            if (scheduled) return { kind: "success", text: `${placeholder}完成后会更新这条结果。` };
           }
 
           try {
@@ -590,7 +660,8 @@ export function apply(ctx) {
       name: "btw",
       description: "旁问：基于当前会话上下文问一句，答案即时返回，不写进会话记忆，也不开启回合",
       input: { hint: "<问题>" },
-      async handler({ agent, rawInput, signal }) {
+      async handler(invocation) {
+        const { agent, rawInput } = invocation;
         const question = String(rawInput ?? "").trim();
         if (question.length === 0) return { kind: "error", text: "用法：/btw <问题>" };
         const llm = getService("llm");
@@ -602,21 +673,35 @@ export function apply(ctx) {
         if (typeof route.provider !== "string" || typeof route.model !== "string") {
           return { kind: "error", text: "btw: 这次会话还没有请求记录，无法确定用哪个模型。" };
         }
-        try {
-          const answer = await askSideModel(llm, {
-            provider: route.provider,
-            model: route.model,
-            messages: [
-              ...snapshotMessages(session),
-              { role: "user", content: [{ type: "text", text: `${BTW_SYSTEM_PROMPT}\n\n<question>\n${question}\n</question>` }] }
-            ],
-            sessionId: session.id,
-            signal
-          });
-          return { kind: "success", text: answer };
-        } catch (error) {
-          return { kind: "error", text: `btw: ${error instanceof Error ? error.message : String(error)}` };
+        const placeholder = "旁问中…";
+        const scheduled = scheduleLateResult(invocation, placeholder, (signal) => askSideModel(llm, {
+          provider: route.provider,
+          model: route.model,
+          messages: [
+            ...snapshotMessages(session),
+            { role: "user", content: [{ type: "text", text: `${BTW_SYSTEM_PROMPT}\n\n<question>\n${question}\n</question>` }] }
+          ],
+          sessionId: session.id,
+          signal
+        }));
+        if (!scheduled) {
+          // No command id (an adapted caller): answer inline, accepting the wait.
+          try {
+            const answer = await askSideModel(llm, {
+              provider: route.provider,
+              model: route.model,
+              messages: [
+                ...snapshotMessages(session),
+                { role: "user", content: [{ type: "text", text: `${BTW_SYSTEM_PROMPT}\n\n<question>\n${question}\n</question>` }] }
+              ],
+              sessionId: session.id
+            });
+            return { kind: "success", text: answer };
+          } catch (error) {
+            return { kind: "error", text: `btw: ${error instanceof Error ? error.message : String(error)}` };
+          }
         }
+        return { kind: "success", text: `${placeholder}（答案会更新在这条结果里）` };
       }
     })];
   };
@@ -627,8 +712,20 @@ export function apply(ctx) {
     ...registerBtw(),
     ctx.on("session/event", (session, event) => {
       if (event?.type === "turn/end") void settleMove(session);
+      if (event?.type === "command/done") {
+        // The executor's settlement landed; the late answer may now replace it.
+        const record = lateResults.get(String(event.data?.commandId));
+        if (record !== undefined && record.session === session) {
+          record.settled = true;
+          flushLateResult(String(event.data.commandId));
+        }
+      }
     })
   ];
+  disposers.push(() => {
+    for (const record of lateResults.values()) record.controller?.abort();
+    lateResults.clear();
+  });
   return () => {
     for (const disposer of disposers) {
       try {
