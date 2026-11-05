@@ -34,7 +34,7 @@ import {
   resolveRoute,
   snapshotMessages
 } from "./lib/side-request.js";
-import { createActivityRoute, createActivityStore } from "./lib/activity.js";
+import { createActivityRoute, createActivityStore, readJsonBody } from "./lib/activity.js";
 
 export const name = "dsh-handoff";
 export const inject = ["tools", "agents", "sessions"];
@@ -639,6 +639,85 @@ export function apply(ctx) {
     `<question>\n${question}\n</question>`
   ].filter((part) => part.length > 0).join("\n\n");
 
+  /**
+   * One side question end to end: route, prompt, request, thread memory.
+   * Shared by the `/btw` handler and the card's follow-up route.
+   */
+  const runBtw = async (session, question, { signal, onDelta } = {}) => {
+    const llm = getService("llm");
+    if (llm === undefined || typeof llm.stream !== "function") {
+      throw new Error("侧路请求需要 llm 服务，但宿主里没有挂载。");
+    }
+    const route = resolveRoute(session);
+    if (typeof route?.provider !== "string" || typeof route?.model !== "string") {
+      throw new Error("这次会话还没有请求记录，无法确定用哪个模型。");
+    }
+    const answered = await askSideModel(llm, {
+      provider: route.provider,
+      model: route.model,
+      system: BTW_SYSTEM_PROMPT,
+      messages: [{
+        role: "user",
+        content: [{ type: "text", text: btwPrompt(session, question) }]
+      }],
+      sessionId: session.id,
+      signal,
+      onDelta
+    });
+    const answer = answered.finishKind === "max-tokens"
+      ? `${answered.text}\n\n（回答达到输出长度上限，已截断）`
+      : answered.text;
+    rememberBtw(session.id, question, answer);
+    return answer;
+  };
+
+  /**
+   * POST /handoff/ask — the card's follow-up input.
+   *
+   * The client used to dispatch `/btw` through `remote.commands`, which needs
+   * the `remote.commands` service injected on the client half; when that wiring
+   * was missing the click did nothing at all. A plain route keeps the follow-up
+   * inside this plugin: one POST in, the same activity slot out.
+   */
+  const askRoute = async (req, res) => {
+    const reply = (status, payload) => {
+      res.writeHead(status, {
+        "content-type": "application/json; charset=utf-8",
+        "cache-control": "no-store"
+      });
+      res.end(JSON.stringify(payload));
+    };
+    if (req.method !== "POST") return reply(405, { error: "POST only" });
+    let body;
+    try {
+      body = await readJsonBody(req);
+    } catch (error) {
+      return reply(error.statusCode ?? 400, { error: error.message });
+    }
+    const sessionId = typeof body?.session === "string" ? body.session : "";
+    const question = typeof body?.question === "string" ? body.question.trim() : "";
+    if (sessionId.length === 0 || question.length === 0) {
+      return reply(400, { error: "session and question are required" });
+    }
+    const session = ctx.sessions.get(sessionId);
+    if (session === undefined) return reply(404, { error: "unknown session" });
+    if (activity.get(sessionId)?.status === "running") {
+      return reply(409, { error: "another side request is still running" });
+    }
+    const entry = activity.begin(sessionId, { kind: "btw", title: "旁问", question });
+    const controller = new AbortController();
+    activity.track(sessionId, controller);
+    void runBtw(session, question, {
+      signal: controller.signal,
+      onDelta: (text) => activity.update(sessionId, entry.id, { text })
+    })
+      .then((answer) => activity.finish(sessionId, entry.id, "done", { text: answer }))
+      .catch((error) => activity.finish(sessionId, entry.id, "error", {
+        text: error instanceof Error ? error.message : String(error)
+      }));
+    return reply(200, { ok: true, activity: entry });
+  };
+
   const describeHandoff = (result, modeText) =>
     `已交接（${modeText}）：会话 ${result.sessionId} 位于工作区「${result.workspaceTitle}」(${result.workspacePath})` +
     (result.workspaceCreated === true ? "（新工作区）" : "") +
@@ -762,22 +841,10 @@ export function apply(ctx) {
         const entry = activity.begin(session.id, { kind: "btw", title: "旁问", question });
         const scheduled = scheduleLateResult(invocation, placeholder, async (signal) => {
           try {
-            const answered = await askSideModel(llm, {
-              provider: route.provider,
-              model: route.model,
-              system: BTW_SYSTEM_PROMPT,
-              messages: [{
-                role: "user",
-                content: [{ type: "text", text: btwPrompt(session, question) }]
-              }],
-              sessionId: session.id,
+            const answer = await runBtw(session, question, {
               signal,
               onDelta: (text) => activity.update(session.id, entry.id, { text })
             });
-            const answer = answered.finishKind === "max-tokens"
-              ? `${answered.text}\n\n（回答达到输出长度上限，已截断）`
-              : answered.text;
-            rememberBtw(session.id, question, answer);
             activity.finish(session.id, entry.id, "done", { text: answer });
             return answer;
           } catch (error) {
@@ -793,20 +860,7 @@ export function apply(ctx) {
         if (!scheduled) {
           // No command id (an adapted caller): answer inline, accepting the wait.
           try {
-            const answered = await askSideModel(llm, {
-              provider: route.provider,
-              model: route.model,
-              system: BTW_SYSTEM_PROMPT,
-              messages: [{
-                role: "user",
-                content: [{ type: "text", text: btwPrompt(session, question) }]
-              }],
-              sessionId: session.id
-            });
-            const answer = answered.finishKind === "max-tokens"
-              ? `${answered.text}\n\n（回答达到输出长度上限，已截断）`
-              : answered.text;
-            rememberBtw(session.id, question, answer);
+            const answer = await runBtw(session, question);
             return { kind: "success", text: answer };
           } catch (error) {
             return { kind: "error", text: `btw: ${error instanceof Error ? error.message : String(error)}` };
@@ -831,6 +885,11 @@ export function apply(ctx) {
           path: "/handoff/activity",
           handler: createActivityRoute(activity)
         }), "handoff activity route"));
+        registered.push(child.effect(() => child.webServer.register({
+          kind: "exact",
+          path: "/handoff/ask",
+          handler: askRoute
+        }), "handoff ask route"));
       });
     } catch (error) {
       log.warn?.(`dsh-handoff: activity route unavailable: ${String(error)}`);

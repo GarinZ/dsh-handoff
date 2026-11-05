@@ -11,9 +11,18 @@ const makeHost = (services = {}) => {
   const commands = [];
   const prompts = [];
   const listeners = [];
+  const routes = [];
+  const sessions = services.sessions ?? { get: () => undefined };
   const ctx = {
     logger: { warn() {}, info() {}, error() {} },
     tools: { register: (tool) => { tools.push(tool); return () => {}; } },
+    sessions,
+    inject: (_names, callback) => {
+      callback({
+        effect: (factory) => { factory(); return () => {}; },
+        webServer: { register: (route) => { routes.push(route); return () => {}; } }
+      });
+    },
     on: (eventName, listener) => { if (eventName === "session/event") listeners.push(listener); return () => {}; },
     get: (key, fallback) => {
       if (key === "commands") {
@@ -27,7 +36,7 @@ const makeHost = (services = {}) => {
   const emit = (session, event) => {
     for (const listener of listeners) listener(session, event);
   };
-  return { ctx, tools, commands, prompts, emit };
+  return { ctx, tools, commands, prompts, emit, routes };
 };
 
 /** Let the scheduled side request settle before the test inspects the result. */
@@ -264,4 +273,59 @@ test("side answers reach a follow-up in full, not clipped", async () => {
   const prompt = llm.calls.at(-1).messages[0].content[0].text;
   assert.ok(prompt.includes(long), "the earlier answer is carried verbatim");
   assert.ok(!prompt.includes("…\n"), "no ellipsis marker");
+});
+
+/** Minimal IncomingMessage/ServerResponse pair for the plugin routes. */
+const fakeRequest = (body, method = "POST") => {
+  const listeners = {};
+  const req = {
+    method,
+    on(event, fn) { (listeners[event] ??= []).push(fn); return req; },
+    resume() {}
+  };
+  setImmediate(() => {
+    if (body !== undefined) for (const fn of listeners.data ?? []) fn(Buffer.from(JSON.stringify(body)));
+    for (const fn of listeners.end ?? []) fn();
+  });
+  return req;
+};
+
+const fakeResponse = () => {
+  const res = { status: 0, payload: undefined, writeHead(status) { res.status = status; }, end(text) { res.payload = text ? JSON.parse(text) : undefined; } };
+  return res;
+};
+
+test("POST /handoff/ask answers a follow-up from the progress card", async () => {
+  const llm = fakeLlm("追问的答案。");
+  const session = fakeSession();
+  const host = makeHost({ llm, sessions: { get: (id) => (id === session.id ? session : undefined) } });
+  apply(host.ctx);
+  const ask = host.routes.find((route) => route.path === "/handoff/ask");
+  assert.ok(ask, "the follow-up route must be registered");
+  const activityRoute = host.routes.find((route) => route.path === "/handoff/activity");
+
+  const res = fakeResponse();
+  await ask.handler(fakeRequest({ session: session.id, question: "还有呢？" }), res);
+  assert.equal(res.status, 200);
+  assert.equal(res.payload.ok, true);
+  assert.equal(res.payload.activity.status, "running");
+
+  await settle();
+  const read = fakeResponse();
+  await activityRoute.handler(fakeRequest(undefined, "GET"), { ...read, writeHead: read.writeHead, end: read.end });
+  // The handler reads the session id from the query string.
+  const polled = fakeResponse();
+  await activityRoute.handler({ url: `/handoff/activity?session=${session.id}`, method: "GET" }, polled);
+  assert.equal(polled.payload.status, "done");
+  assert.equal(polled.payload.text, "追问的答案。");
+  assert.ok(llm.calls.at(-1).messages[0].content[0].text.includes("还有呢？"));
+});
+
+test("POST /handoff/ask rejects an unknown session", async () => {
+  const host = makeHost({ sessions: { get: () => undefined } });
+  apply(host.ctx);
+  const ask = host.routes.find((route) => route.path === "/handoff/ask");
+  const res = fakeResponse();
+  await ask.handler(fakeRequest({ session: "nope", question: "hi" }), res);
+  assert.equal(res.status, 404);
 });

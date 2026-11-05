@@ -63,10 +63,6 @@ window.__ModuleLoader__.load({
       }
     }
 
-    // Filled in by `apply`: a follow-up question is just another slash command,
-    // so the card can hand it to the same remote path the composer uses.
-    const followUp = { execute: null }
-
     let pollGeneration = 0
 
     function poll(sessionId) {
@@ -102,30 +98,23 @@ window.__ModuleLoader__.load({
     function askFollowUp(sessionId, question) {
       const text = String(question ?? '').trim()
       if (text.length === 0) return false
-      if (typeof followUp.execute !== 'function') {
-        failFollowUp('追问发送失败：客户端没有拿到 remote.commands 服务。')
-        return false
-      }
-      let reply
-      try {
-        // The line needs its leading slash: the host parses it exactly like a
-        // composer submission, and an unknown command is dropped silently.
-        reply = followUp.execute(sessionId, `/btw ${text}`)
-      } catch (error) {
-        failFollowUp(`追问发送失败：${error?.message ?? error}`)
-        return false
-      }
-      Promise.resolve(reply).then((result) => {
-        if (result && result.ok === false) {
-          failFollowUp(`追问发送失败：${result.error?.message ?? result.error?.code ?? 'unknown error'}`)
-        } else if (result && result.value === undefined) {
-          failFollowUp('追问没有被接受：宿主里没有可用的 /btw 命令。')
-        }
-      }).catch((error) => {
-        failFollowUp(`追问发送失败：${error?.message ?? error}`)
+      // The follow-up is a plain POST to this plugin's own route: no client
+      // command service, no transcript noise, and nothing to silently drop.
+      fetch('/handoff/ask', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ session: sessionId, question: text })
       })
-      // The host replaces the slot; restart the loop so the card follows it.
-      poll(sessionId)
+        .then((response) => response.json().then((body) => ({ ok: response.ok, body })))
+        .then(({ ok, body }) => {
+          if (!ok) {
+            failFollowUp(`追问发送失败：${body?.error ?? 'unknown error'}`)
+            return
+          }
+          if (body?.activity) store.set({ activity: body.activity, open: true })
+          poll(sessionId)
+        })
+        .catch((error) => failFollowUp(`追问发送失败：${error?.message ?? error}`))
       return true
     }
 
@@ -238,17 +227,8 @@ window.__ModuleLoader__.load({
     }
 
     return {
-      inject: ['slots', 'remote'],
+      inject: ['slots'],
       apply(ctx) {
-        try {
-          const remote = ctx.remote ?? ctx.get?.('remote')
-          if (remote?.commands?.execute) {
-            followUp.execute = (sessionId, line) => remote.commands.execute(sessionId, line, [])
-          }
-        } catch {
-          // No remote service: the follow-up input simply stays inert.
-        }
-
         ctx.effect(() => {
           const style = document.createElement('style')
           style.textContent = [
