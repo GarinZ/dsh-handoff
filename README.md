@@ -23,6 +23,10 @@ dsh-handoff 用 DSH 自己的能力做三件事：
 从 GitHub 直装：
 
 ```bash
+# 从 npm
+dsh plugin --profile <profile> add @garinz/dsh-handoff
+
+# 或直接从 GitHub
 dsh plugin --profile <profile> add github:GarinZ/dsh-handoff
 ```
 
@@ -36,7 +40,7 @@ dsh plugin --profile desktop add .
 
 宿主半热加载，装完即可用；不需要客户端插件，因此也不用刷新页面。
 
-> 仓库：<https://github.com/GarinZ/dsh-handoff>
+> 仓库：<https://github.com/GarinZ/dsh-handoff> · npm：<https://www.npmjs.com/package/@garinz/dsh-handoff>
 
 ## 使用
 

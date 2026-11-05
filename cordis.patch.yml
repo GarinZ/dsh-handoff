@@ -1,5 +1,5 @@
-# dsh-handoff bundle 层：插入 handoff 插件行。
+# dsh-handoff bundle 层：插入 handoff 插件行（name 必须与包名一致）。
 - insert:
     - id: dsh-handoff
-      name: 'dsh-handoff'
+      name: '@garinz/dsh-handoff'
       config: {}
