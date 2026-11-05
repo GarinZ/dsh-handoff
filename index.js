@@ -35,6 +35,7 @@ import {
   snapshotMessages
 } from "./lib/side-request.js";
 import { createActivityRoute, createActivityStore, readJsonBody } from "./lib/activity.js";
+import { appendBrief } from "./lib/brief-append.js";
 
 export const name = "dsh-handoff";
 export const inject = ["tools", "agents", "sessions"];
@@ -217,8 +218,21 @@ export function apply(ctx) {
     return undefined;
   };
 
-  /** Record the brief in the new session: a plain message, or a real turn when asked. */
-  const attachBrief = async ({ controller, sessionId, session, text, startTurn, signal }) => {
+  /**
+   * Record the brief in the new session: a plain message, or a real turn when
+   * asked.
+   *
+   * `ensureVisible` wraps the brief in a closed turn of its own. The GUI decides
+   * whether a Session exists by reading the `sessionListMetadata.blank`
+   * projection, which only `turn/start` clears (`dsh-api-session-controller`
+   * `applySessionListMetadata`: `blank: state.blank && event.type !==
+   * 'turn/start'`). A summary-only handoff creates a session with no turns at
+   * all, so without this it stays a hidden "new conversation" placeholder even
+   * though its log already holds the brief. The turn carries no step and no
+   * assistant message — the loop itself closes turns with no step when the input
+   * was empty or rejected — so nothing is sent to a model.
+   */
+  const attachBrief = async ({ controller, sessionId, session, text, startTurn, ensureVisible, signal }) => {
     if (startTurn) {
       await controller.prompt(
         { requestId: randomUUID(), sessionId, mode: "queue", content: [{ type: "text", text }] },
@@ -228,11 +242,7 @@ export function apply(ctx) {
     }
     if (session !== undefined && typeof session.append === "function") {
       try {
-        session.append(
-          "user/message",
-          { id: randomUUID(), role: "user", content: [{ type: "text", text }], source: { kind: "user" } },
-          { surfaceOp: "append" }
-        );
+        appendBrief(session, text, { ensureVisible, messageId: randomUUID() });
         return { briefAttached: true, turnStarted: false };
       } catch (error) {
         log.warn?.(`dsh-handoff: direct brief append failed, falling back to a prompt: ${String(error)}`);
@@ -291,6 +301,7 @@ export function apply(ctx) {
       session: child,
       text: buildSummaryOnlyBrief(sourceId, source.header.cwd, summary),
       startTurn: args?.start_turn === true,
+      ensureVisible: true,
       signal: exec.signal ?? new AbortController().signal
     });
 
