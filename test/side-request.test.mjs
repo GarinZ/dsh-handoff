@@ -2,12 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   askSideModel,
+  buildTranscript,
   countConversationMessages,
   formatFailure,
   resolveRoute,
-  selectMessages,
-  snapshotMessages,
-  trimToolBoundary
+  snapshotMessages
 } from "../lib/side-request.js";
 
 const streamOf = (chunks) => ({
@@ -99,42 +98,32 @@ test("formatFailure turns an LlmFailure into a readable line", () => {
   assert.equal(formatFailure(undefined), "side request failed");
 });
 
-test("trimToolBoundary drops a dangling tool call and keeps complete ones", () => {
-  const pending = [
-    { role: "user", content: [] },
-    { role: "assistant", content: [{ type: "tool-call", id: "call-1" }] },
-    { role: "tool", toolCallId: "other", content: [] }
-  ];
-  assert.deepEqual(trimToolBoundary(pending), [{ role: "user", content: [] }]);
-  const complete = [
-    { role: "user", content: [] },
-    { role: "assistant", content: [{ type: "tool-call", id: "call-1" }] },
-    { role: "tool", toolCallId: "call-1", content: [] }
-  ];
-  assert.equal(trimToolBoundary(complete), complete);
-});
 
-test("selectMessages keeps the system prompt, cuts from the front and strips images", () => {
+test("buildTranscript flattens roles and replaces images with a placeholder", () => {
   const messages = [
     { role: "system", content: [{ type: "text", text: "sys" }] },
-    { role: "assistant", content: [{ type: "text", text: "orphan" }] },
-    { role: "user", content: [{ type: "image", url: "blob:x" }, { type: "text", text: "look" }] },
-    { role: "assistant", content: [{ type: "text", text: "seen" }] },
-    { role: "user", content: [{ type: "text", text: "next" }] }
+    { role: "user", content: [{ type: "text", text: "看图" }, { type: "image", url: "blob:x" }] },
+    { role: "assistant", content: [{ type: "text", text: "好" }, { type: "tool-call", name: "bash", arguments: "echo hi" }] },
+    { role: "tool", content: [{ type: "text", text: "hi" }] }
   ];
-  const bounded = selectMessages(messages, { maxMessages: 3, maxChars: 10_000 });
-  assert.equal(bounded.messages[0].role, "system");
-  assert.equal(bounded.messages[1].role, "user");
-  assert.deepEqual(bounded.messages[1].content[0], { type: "text", text: "[图片]" });
-  assert.equal(bounded.truncated, true);
-  assert.equal(bounded.dropped, 1);
+  const { text, truncated } = buildTranscript(messages);
+  assert.equal(truncated, false);
+  assert.ok(text.includes("## 用户"));
+  assert.ok(text.includes("## 助手"));
+  assert.ok(text.includes("[调用工具 bash] echo hi"));
+  assert.ok(text.includes("## 工具结果"));
+  assert.ok(!text.includes("sys"), "the system prompt is not part of the transcript");
 });
 
-test("selectMessages stops on the character budget", () => {
-  const big = (text) => ({ role: "user", content: [{ type: "text", text }] });
-  const messages = [big("a".repeat(400)), { role: "assistant", content: [{ type: "text", text: "b".repeat(400) }] }, big("c".repeat(400))];
-  const bounded = selectMessages(messages, { maxMessages: 10, maxChars: 700 });
-  assert.equal(bounded.messages.length, 1);
-  assert.equal(bounded.dropped, 2);
-  assert.equal(bounded.truncated, true);
+test("buildTranscript keeps the newest entries inside the character budget", () => {
+  const messages = [
+    { role: "user", content: [{ type: "text", text: "old".repeat(100) }] },
+    { role: "assistant", content: [{ type: "text", text: "new".repeat(100) }] }
+  ];
+  const { text, dropped, truncated } = buildTranscript(messages, { maxChars: 320 });
+  assert.equal(truncated, true);
+  assert.equal(dropped, 1);
+  assert.ok(text.startsWith("（更早的 1 条消息已省略）"));
+  assert.ok(text.includes("new"));
+  assert.ok(!text.includes("old"));
 });

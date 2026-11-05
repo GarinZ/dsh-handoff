@@ -153,10 +153,17 @@ test("/btw answers over a snapshot without prompting the agent", async () => {
   assert.equal(call.provider, "deepseek-official");
   assert.equal(call.model, "deepseek-flash");
   assert.equal(call.sessionId, "session-abc");
-  const last = call.messages.at(-1);
+  // The request is flattened: rules go in `system`, the transcript and the
+  // question travel as one user message (structured history is what providers
+  // reject when no tools are declared).
+  assert.equal(call.messages.length, 1);
+  const last = call.messages[0];
   assert.equal(last.role, "user");
-  assert.ok(last.content[0].text.includes("这个仓库用什么许可证？"));
-  assert.ok(call.messages.some((message) => message.role === "system"), "the session system prompt is forwarded");
+  const prompt = last.content[0].text;
+  assert.ok(prompt.includes("这个仓库用什么许可证？"));
+  assert.ok(prompt.includes("<conversation>"));
+  assert.ok(prompt.includes("do the work"), "the transcript carries the conversation");
+  assert.ok(call.system.includes("<critical>") || call.system.length > 0, "the btw rules travel as the system prompt");
 
   // The executor settles first; the answer then replaces the placeholder node.
   await settle();

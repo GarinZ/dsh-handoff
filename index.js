@@ -28,10 +28,10 @@ import { relocateSession } from "./lib/relocate.js";
 import { BTW_SYSTEM_PROMPT, buildBriefPrompt, buildInstructionText } from "./lib/prompts.js";
 import {
   askSideModel,
+  buildTranscript,
   countConversationMessages,
   formatFailure,
   resolveRoute,
-  selectMessages,
   snapshotMessages
 } from "./lib/side-request.js";
 import { createActivityRoute, createActivityStore } from "./lib/activity.js";
@@ -583,25 +583,27 @@ export function apply(ctx) {
     const messages = snapshotMessages(session);
     if (countConversationMessages(messages) < 2) return undefined;
     // A handoff brief is worth a bigger window than a side question, but never
-    // the whole session: providers reject it and the bill is not worth it.
-    const bounded = selectMessages(messages, { maxMessages: 240, maxChars: 400_000 });
-    return { llm, session, route, target, messages: bounded.messages, truncated: bounded.truncated, dropped: bounded.dropped };
+    // the whole session: providers reject structured replays and the bill is
+    // not worth it. Flatten to text, newest messages first in the budget.
+    const transcript = buildTranscript(messages, { maxChars: 400_000 });
+    if (transcript.text.length === 0) return undefined;
+    return { llm, session, route, target, transcript };
   };
 
   const executeSideHandoff = async (plan, { agent, sessionId, request, history, signal, onBriefDelta, onPhase }) => {
     const brief = await askSideModel(plan.llm, {
       provider: plan.route.provider,
       model: plan.route.model,
-      messages: [
-        ...plan.messages,
-        {
-          role: "user",
-          content: [{
-            type: "text",
-            text: buildBriefPrompt({ request, history, truncated: plan.truncated, dropped: plan.dropped })
-          }]
-        }
-      ],
+      system: buildBriefPrompt({
+        request,
+        history,
+        truncated: plan.transcript.truncated,
+        dropped: plan.transcript.dropped
+      }),
+      messages: [{
+        role: "user",
+        content: [{ type: "text", text: `<conversation>\n${plan.transcript.text}\n</conversation>` }]
+      }],
       sessionId,
       signal,
       maxTokens: 8192,
@@ -613,11 +615,11 @@ export function apply(ctx) {
   };
 
   /**
-   * A side question only needs the recent stretch of the conversation. Replay
-   * errors and context blowups both come from sending everything.
+   * A side question only needs the recent stretch of the conversation, and it
+   * needs it as text: replaying the structured history is what the provider
+   * rejects when the request declares no tools.
    */
-  const btwMessages = (session) =>
-    selectMessages(snapshotMessages(session), { maxMessages: 80, maxChars: 200_000 }).messages;
+  const btwMessages = (session) => buildTranscript(snapshotMessages(session), { maxChars: 200_000 });
 
   const describeHandoff = (result, modeText) =>
     `已交接（${modeText}）：会话 ${result.sessionId} 位于工作区「${result.workspaceTitle}」(${result.workspacePath})` +
@@ -745,10 +747,14 @@ export function apply(ctx) {
             const answer = await askSideModel(llm, {
               provider: route.provider,
               model: route.model,
-              messages: [
-                ...btwMessages(session),
-                { role: "user", content: [{ type: "text", text: `${BTW_SYSTEM_PROMPT}\n\n<question>\n${question}\n</question>` }] }
-              ],
+              system: BTW_SYSTEM_PROMPT,
+              messages: [{
+                role: "user",
+                content: [{
+                  type: "text",
+                  text: `<conversation>\n${btwMessages(session).text}\n</conversation>\n\n<question>\n${question}\n</question>`
+                }]
+              }],
               sessionId: session.id,
               signal,
               maxTokens: 2000,
@@ -772,10 +778,14 @@ export function apply(ctx) {
             const answer = await askSideModel(llm, {
               provider: route.provider,
               model: route.model,
-              messages: [
-                ...btwMessages(session),
-                { role: "user", content: [{ type: "text", text: `${BTW_SYSTEM_PROMPT}\n\n<question>\n${question}\n</question>` }] }
-              ],
+              system: BTW_SYSTEM_PROMPT,
+              messages: [{
+                role: "user",
+                content: [{
+                  type: "text",
+                  text: `<conversation>\n${btwMessages(session).text}\n</conversation>\n\n<question>\n${question}\n</question>`
+                }]
+              }],
               sessionId: session.id,
               maxTokens: 2000
             });
