@@ -93,14 +93,37 @@ window.__ModuleLoader__.load({
       setTimeout(tick, 120)
     }
 
+    function failFollowUp(message) {
+      const activity = store.state.activity
+      if (!activity) return
+      store.set({ activity: { ...activity, status: 'error', text: message } })
+    }
+
     function askFollowUp(sessionId, question) {
       const text = String(question ?? '').trim()
-      if (text.length === 0 || typeof followUp.execute !== 'function') return false
-      try {
-        followUp.execute(sessionId, `btw ${text}`)
-      } catch {
+      if (text.length === 0) return false
+      if (typeof followUp.execute !== 'function') {
+        failFollowUp('追问发送失败：客户端没有拿到 remote.commands 服务。')
         return false
       }
+      let reply
+      try {
+        // The line needs its leading slash: the host parses it exactly like a
+        // composer submission, and an unknown command is dropped silently.
+        reply = followUp.execute(sessionId, `/btw ${text}`)
+      } catch (error) {
+        failFollowUp(`追问发送失败：${error?.message ?? error}`)
+        return false
+      }
+      Promise.resolve(reply).then((result) => {
+        if (result && result.ok === false) {
+          failFollowUp(`追问发送失败：${result.error?.message ?? result.error?.code ?? 'unknown error'}`)
+        } else if (result && result.value === undefined) {
+          failFollowUp('追问没有被接受：宿主里没有可用的 /btw 命令。')
+        }
+      }).catch((error) => {
+        failFollowUp(`追问发送失败：${error?.message ?? error}`)
+      })
       // The host replaces the slot; restart the loop so the card follows it.
       poll(sessionId)
       return true
