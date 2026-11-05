@@ -105,7 +105,7 @@ dsh plugin --profile desktop add .
 
 侧路请求发的是**扁平文本**，不是结构化历史：把会话压成 `## 用户 / ## 助手 / ## 工具结果` 的对话记录，塞进一条 user 消息，规则走 system。原因很实际——请求里不声明 tools 时，provider 会拒绝带 `tool-call` 块和图片的原始历史；这也是市场里 BTW 插件清一色这么做的原因。预算按字符算：旁问 20 万字符、简报 40 万字符，超了从最旧的整条丢起，并在开头注明「更早的 N 条消息已省略」；图片一律变 `[图片]`。
 
-失败时显示 provider 原文（`message (CODE) HTTP 400`），不再是 `[object Object]`。侧路请求的 `maxTokens` 是旁问 8000、简报 12000；如果 provider 以 `max-tokens` 结束，卡片和命令结果都会明确标注「已达输出长度上限，已截断」，而不是把半句话当成完整答案。
+失败时显示 provider 原文（`message (CODE) HTTP 400`），不再是 `[object Object]`。侧路请求**不写死 `maxTokens`**：留空时 `ctx.llm` 会填上该模型自己声明的 `defaultMaxTokens`，和普通回合的上限一致，也就不会出现「聊天能写完、旁问却被截在半句」这种事。万一仍以 `max-tokens` 结束，卡片和命令结果会明确标注「已达输出长度上限，已截断」，而不是把半句话当成完整答案。
 
 ### 进度面板
 

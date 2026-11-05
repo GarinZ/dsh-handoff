@@ -606,7 +606,6 @@ export function apply(ctx) {
       }],
       sessionId,
       signal,
-      maxTokens: 12_000,
       onDelta: onBriefDelta
     });
     const brief = answered.finishKind === "max-tokens"
@@ -760,7 +759,6 @@ export function apply(ctx) {
               }],
               sessionId: session.id,
               signal,
-              maxTokens: 8_000,
               onDelta: (text) => activity.update(session.id, entry.id, { text })
             });
             const answer = answered.finishKind === "max-tokens"
@@ -792,8 +790,7 @@ export function apply(ctx) {
                   text: `<conversation>\n${btwMessages(session).text}\n</conversation>\n\n<question>\n${question}\n</question>`
                 }]
               }],
-              sessionId: session.id,
-              maxTokens: 8_000
+              sessionId: session.id
             });
             const answer = answered.finishKind === "max-tokens"
               ? `${answered.text}\n\n（回答达到输出长度上限，已截断）`
