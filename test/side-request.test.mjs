@@ -1,6 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { askSideModel, countConversationMessages, resolveRoute, snapshotMessages } from "../lib/side-request.js";
+import {
+  askSideModel,
+  countConversationMessages,
+  formatFailure,
+  resolveRoute,
+  selectMessages,
+  snapshotMessages,
+  trimToolBoundary
+} from "../lib/side-request.js";
 
 const streamOf = (chunks) => ({
   async *stream(request) {
@@ -79,4 +87,54 @@ test("askSideModel surfaces stream errors and empty answers", async () => {
 
   await assert.rejects(() => askSideModel(undefined, { provider: "p", model: "m" }), /llm service/);
   await assert.rejects(() => askSideModel(streamOf([]), { model: "m" }), /provider and model/);
+});
+
+test("formatFailure turns an LlmFailure into a readable line", () => {
+  assert.equal(
+    formatFailure({ message: "context length exceeded", code: "CONTEXT_LENGTH_EXCEEDED", status: 400 }),
+    "context length exceeded (CONTEXT_LENGTH_EXCEEDED) HTTP 400"
+  );
+  assert.equal(formatFailure("boom"), "boom");
+  assert.equal(formatFailure(new Error("nope")), "nope");
+  assert.equal(formatFailure(undefined), "side request failed");
+});
+
+test("trimToolBoundary drops a dangling tool call and keeps complete ones", () => {
+  const pending = [
+    { role: "user", content: [] },
+    { role: "assistant", content: [{ type: "tool-call", id: "call-1" }] },
+    { role: "tool", toolCallId: "other", content: [] }
+  ];
+  assert.deepEqual(trimToolBoundary(pending), [{ role: "user", content: [] }]);
+  const complete = [
+    { role: "user", content: [] },
+    { role: "assistant", content: [{ type: "tool-call", id: "call-1" }] },
+    { role: "tool", toolCallId: "call-1", content: [] }
+  ];
+  assert.equal(trimToolBoundary(complete), complete);
+});
+
+test("selectMessages keeps the system prompt, cuts from the front and strips images", () => {
+  const messages = [
+    { role: "system", content: [{ type: "text", text: "sys" }] },
+    { role: "assistant", content: [{ type: "text", text: "orphan" }] },
+    { role: "user", content: [{ type: "image", url: "blob:x" }, { type: "text", text: "look" }] },
+    { role: "assistant", content: [{ type: "text", text: "seen" }] },
+    { role: "user", content: [{ type: "text", text: "next" }] }
+  ];
+  const bounded = selectMessages(messages, { maxMessages: 3, maxChars: 10_000 });
+  assert.equal(bounded.messages[0].role, "system");
+  assert.equal(bounded.messages[1].role, "user");
+  assert.deepEqual(bounded.messages[1].content[0], { type: "text", text: "[图片]" });
+  assert.equal(bounded.truncated, true);
+  assert.equal(bounded.dropped, 1);
+});
+
+test("selectMessages stops on the character budget", () => {
+  const big = (text) => ({ role: "user", content: [{ type: "text", text }] });
+  const messages = [big("a".repeat(400)), { role: "assistant", content: [{ type: "text", text: "b".repeat(400) }] }, big("c".repeat(400))];
+  const bounded = selectMessages(messages, { maxMessages: 10, maxChars: 700 });
+  assert.equal(bounded.messages.length, 1);
+  assert.equal(bounded.dropped, 2);
+  assert.equal(bounded.truncated, true);
 });

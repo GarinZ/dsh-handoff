@@ -26,7 +26,14 @@ import { basename, join } from "node:path";
 import { realpath, stat } from "node:fs/promises";
 import { relocateSession } from "./lib/relocate.js";
 import { BTW_SYSTEM_PROMPT, buildBriefPrompt, buildInstructionText } from "./lib/prompts.js";
-import { askSideModel, countConversationMessages, resolveRoute, snapshotMessages } from "./lib/side-request.js";
+import {
+  askSideModel,
+  countConversationMessages,
+  formatFailure,
+  resolveRoute,
+  selectMessages,
+  snapshotMessages
+} from "./lib/side-request.js";
 import { createActivityRoute, createActivityStore } from "./lib/activity.js";
 
 export const name = "dsh-handoff";
@@ -555,7 +562,7 @@ export function apply(ctx) {
       (error) => {
         controller.abort();
         const prefix = hooks.failurePrefix ?? `${placeholder}失败`;
-        record.outcome = { kind: "error", text: `${prefix}：${error instanceof Error ? error.message : String(error)}` };
+        record.outcome = { kind: "error", text: `${prefix}：${formatFailure(error)}` };
         flushLateResult(key);
       }
     );
@@ -575,14 +582,26 @@ export function apply(ctx) {
     if (target === undefined) return undefined;
     const messages = snapshotMessages(session);
     if (countConversationMessages(messages) < 2) return undefined;
-    return { llm, session, route, target, messages };
+    // A handoff brief is worth a bigger window than a side question, but never
+    // the whole session: providers reject it and the bill is not worth it.
+    const bounded = selectMessages(messages, { maxMessages: 240, maxChars: 400_000 });
+    return { llm, session, route, target, messages: bounded.messages, truncated: bounded.truncated, dropped: bounded.dropped };
   };
 
   const executeSideHandoff = async (plan, { agent, sessionId, request, history, signal, onBriefDelta, onPhase }) => {
     const brief = await askSideModel(plan.llm, {
       provider: plan.route.provider,
       model: plan.route.model,
-      messages: [...plan.messages, { role: "user", content: [{ type: "text", text: buildBriefPrompt({ request, history }) }] }],
+      messages: [
+        ...plan.messages,
+        {
+          role: "user",
+          content: [{
+            type: "text",
+            text: buildBriefPrompt({ request, history, truncated: plan.truncated, dropped: plan.dropped })
+          }]
+        }
+      ],
       sessionId,
       signal,
       maxTokens: 8192,
@@ -592,6 +611,13 @@ export function apply(ctx) {
     const result = await handoffTool.execute({ target: plan.target, summary: brief, history }, { agent, sessionId, signal });
     return { result, brief };
   };
+
+  /**
+   * A side question only needs the recent stretch of the conversation. Replay
+   * errors and context blowups both come from sending everything.
+   */
+  const btwMessages = (session) =>
+    selectMessages(snapshotMessages(session), { maxMessages: 80, maxChars: 200_000 }).messages;
 
   const describeHandoff = (result, modeText) =>
     `已交接（${modeText}）：会话 ${result.sessionId} 位于工作区「${result.workspaceTitle}」(${result.workspacePath})` +
@@ -720,11 +746,12 @@ export function apply(ctx) {
               provider: route.provider,
               model: route.model,
               messages: [
-                ...snapshotMessages(session),
+                ...btwMessages(session),
                 { role: "user", content: [{ type: "text", text: `${BTW_SYSTEM_PROMPT}\n\n<question>\n${question}\n</question>` }] }
               ],
               sessionId: session.id,
               signal,
+              maxTokens: 2000,
               onDelta: (text) => activity.update(session.id, entry.id, { text })
             });
             activity.finish(session.id, entry.id, "done", { text: answer });
@@ -746,10 +773,11 @@ export function apply(ctx) {
               provider: route.provider,
               model: route.model,
               messages: [
-                ...snapshotMessages(session),
+                ...btwMessages(session),
                 { role: "user", content: [{ type: "text", text: `${BTW_SYSTEM_PROMPT}\n\n<question>\n${question}\n</question>` }] }
               ],
-              sessionId: session.id
+              sessionId: session.id,
+              maxTokens: 2000
             });
             return { kind: "success", text: answer };
           } catch (error) {
