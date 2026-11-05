@@ -1,0 +1,12 @@
+dsh-handoff
+Copyright (c) 2026 Garin
+
+This product includes software adapted from third parties:
+
+lib/relocate.js
+  Adapted from dsh-cd (https://github.com/john-walks-slow/dsh-cd),
+  Copyright (c) 2026 johnnren, released under the MIT License.
+
+Session storage layout encoding rules (projectKey / encodeSegment) are taken
+from the DeepSeek Harness JSONL persistence backend; the same code appears in
+dsh-session-manager (https://github.com/hkkz9522/dsh-session-manager), MIT.
