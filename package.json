@@ -18,7 +18,7 @@
     "NOTICE"
   ],
   "scripts": {
-    "test": "node --test test/relocate.test.mjs"
+    "test": "node --test test/*.test.mjs"
   },
   "dsh": {
     "bundle": {

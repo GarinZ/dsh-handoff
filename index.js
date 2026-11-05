@@ -479,7 +479,7 @@ export function apply(ctx) {
             try { return ctx.get("sessionController", false); } catch { return undefined; }
           })();
           const sessionId = agent?.session?.id ?? agent?.id;
-          if (controller === undefined || typeof sessionId !== "string") {
+          if (controller === undefined || typeof controller?.prompt !== "function" || typeof sessionId !== "string") {
             return { kind: "error", text: "handoff: 会话控制器不可用，无法发起交接。" };
           }
           try {
