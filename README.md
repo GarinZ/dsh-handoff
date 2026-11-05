@@ -1,6 +1,15 @@
 # dsh-handoff
 
-给 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）的**会话交接插件**：Agent 在对话里就能把当前会话**完整复制**到另一个工作区，新会话保留全部历史，并附上一份交接简报。原会话原封不动。
+给 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）的**会话交接插件**：Agent 在对话里就能把当前会话交接到另一个工作区。新会话在目标工作区里**热创建**（不重启、不刷新），并带着一份交接简报。
+
+交接有两种历史策略：
+
+| 模式 | `history` | 新会话里有什么 | 什么时候用 |
+| --- | --- | --- | --- |
+| **全文复制**（默认） | `full` | 完整事件历史 + 交接简报 | 新会话需要精确上下文，且源会话还健康 |
+| **仅摘要** | `summary` | 只有交接简报 | 源会话已经很大、上下文快撑爆，或用了不支持主动压缩的插件 |
+
+原会话始终保持不变（`mode: "copy"` 时）。
 
 不需要点按钮，也不需要退出重开——你对 Agent 说一句：
 
@@ -16,11 +25,15 @@ dsh-handoff 用 DSH 自己的能力做三件事：
 
 1. **fork** — `sessionController.fork()` 把当前会话的事件前缀复制成一个独立的新会话（不写 `parentSession`，所以侧栏和可恢复集合都认它）；
 2. **relocate** — 把新会话的存储迁到目标工作区：重写日志头行的 `cwd`、重绑活动写句柄、切换工作区账本。全程不重启；
-3. **brief** — 把你写的交接简报追加成新会话的第一条消息，于是新会话既有完整历史，也有一份能先读的摘要。
+3. **brief** — 把你写的交接简报追加成新会话的第一条消息。
+
+### 为什么需要「仅摘要」
+
+fork 是**事实复制**，不是压缩：源会话如果已经被上下文压力拖到边缘，复制出来的会话会继承同样的压力。最典型的例子是同装了不做主动 compact 的上下文插件——源会话压不下去，新会话同样压不下去，于是「交接」只是把一个快废掉的会话再复制一份。
+
+`history: "summary"` 于是干脆不复制事件：直接在目标工作区新建一个空白会话，把简报写进去。新会话的上下文压力从零开始，代价是丢掉了原始对话里的细节（工具输出、文件内容、原话）。
 
 ## 安装
-
-从 GitHub 直装：
 
 ```bash
 # 从 npm
@@ -44,10 +57,23 @@ dsh plugin --profile desktop add .
 
 ## 使用
 
-直接说人话，例如：
+### 斜杠命令
+
+插件注册了两个命令，输入 `/` 就能看到：
+
+- `/handoff <target>` — 全文复制模式：让 Agent 写简报，然后把**完整历史**交接到 `target`。
+- `/handoff-summary <target>` — 仅摘要模式：让 Agent 写简报，然后在 `target` 里开一个**只有简报**的新会话。
+
+`target` 可以是绝对路径、`~` 开头的路径、工作区 id，或工作区标题。命令本身读不到你的对话，所以它的做法是往当前会话里排一条指令，由模型读完上下文后自己写简报、调用工具。想顺手指定标题，可以在命令后面多写一句：
+
+```
+/handoff-summary ~/work/another-repo 标题叫「迁移到 v2」
+```
+
+### 直接说人话
 
 - 「把这个会话交接给 `/Users/me/Project/new-repo`」
-- 「我们换个工作区继续，搬到 `~/work/another-project`，写个总结」
+- 「我们换个工作区继续，搬到 `~/work/another-project`，只写总结别复制历史」
 - 「hand this off to the agent-skills repo and summarize where we are」
 
 Agent 会调用：
@@ -56,20 +82,40 @@ Agent 会调用：
 {
   "target": "/Users/me/Project/new-repo",
   "summary": "目标：…\n已决定：…\n已完成：…\n待办：…\n关键文件：…",
+  "history": "full",
   "title": "可选：给新会话一个能认出来的标题",
   "start_turn": false
 }
 ```
 
 - `target`：工作区绝对路径（或 `~` 开头）、工作区 id、或工作区标题。目录存在但没有工作区记录时会自动注册。
-- `summary`：交接简报，由模型根据上下文撰写，会作为新会话的第一条消息。
+- `summary`：交接简报，由模型根据上下文撰写。`history: "full"` 时它是补充；`history: "summary"` 时它是新会话**唯一**的上下文，所以要写全：目标、决定及理由、已完成、待办、要重新打开的文件、验证步骤。
+- `history`：`full`（默认）复制完整历史；`summary` 不复制任何事件，只开一个带简报的空白会话。
 - `title`：可选，避免目标工作区里出现两个同名会话。
 - `start_turn`：为 `true` 时立刻在新会话里跑一轮（它会读到简报并回应）；默认只记录，不消耗模型调用。
-- `mode`：`copy`（默认）复制出一个新会话，原会话不动；`move` 把**当前会话本身**在回合结束后迁到目标工作区（id 不变、历史全保留），并在新位置写入简报——适合「这个对话本身就该在那边继续」。
+- `mode`：`copy`（默认）复制出一个新会话，原会话不动；`move` 把**当前会话本身**在回合结束后迁到目标工作区（id 不变、历史全保留），并在新位置写入简报——适合「这个对话本身就该在那边继续」。`move` 只能搭配 `history: "full"`。
+
+## 两种模式各自的落盘结果
+
+`history: "full"`：
+
+```
+<目标工作区>/…/session-<new>/session.v4.jsonl.zstd
+  header.cwd = 目标工作区
+  事件 = 源会话的完整前缀 + 简报
+```
+
+`history: "summary"`：
+
+```
+<目标工作区>/…/session-<new>/session.v4.jsonl.zstd
+  header.cwd = 目标工作区
+  事件 = 标题 + 简报（没有别的）
+```
 
 ## 行为细节
 
-- **复制而不是移动**：源会话的日志、标题、工作区归属都不变；新会话是独立的一份。
+- **复制而不是移动**（`mode: "copy"`）：源会话的日志、标题、工作区归属都不变；新会话是独立的一份。
 - **热创建**：新会话出现在目标工作区的侧栏里，无需重启 DSH。
 - **来源约束**：subagent 会话不能交接；没有记录 `cwd` 的会话不能交接。
 - **工作目录**：新会话的 `header.cwd` 是目标工作区路径，因此沙箱根、AGENTS.md、skills 发现都跟着走。
@@ -78,14 +124,15 @@ Agent 会调用：
 
 ## 已知边界
 
-- 交接过来的是 **fork 语义**：新会话的 `isSeeded` 为 `true`，历史标记为继承（`session/end-seed`）。它可正常打开、继续对话，但依赖「自身事件」的功能（例如按会话统计 token 用量）会把继承部分算作前人历史。
+- 全文模式交接过来的是 **fork 语义**：新会话的 `isSeeded` 为 `true`，历史标记为继承（`session/end-seed`）。它可正常打开、继续对话，但依赖「自身事件」的功能（例如按会话统计 token 用量）会把继承部分算作前人历史。
+- 摘要模式的新会话**没有**继承历史，因此也不会有这些问题；反过来说，它只知道简报里写了的东西。
 - 侧栏刷新时机由 DSH 客户端决定；工作区账本与日志是即时写好的，个别界面状态可能需要切一下工作区或刷新页面才显示。
-- 依赖若干 DSH 内部接口（`sessionPersistence.tracker.writers`、`workspaceRegistry.indexHeader/attachSession`）。DSH 升级后请先在一个临时会话上验证。
+- 依赖若干 DSH 内部接口（`sessionPersistence.tracker.writers`、`workspaceRegistry.indexHeader/attachSession`、`commands.register`）。DSH 升级后请先在一个临时会话上验证。
 
 ## 兼容性
 
 - 开发与验证环境：DSH `0.2.2-rc.1`（macOS 桌面版），Node 24。
-- 需要 hosting 暴露 `sessionController`、`workspaceRegistry`、`sessionPersistence` 三个服务（官方 `dsh-base` 都有）。
+- 需要 hosting 暴露 `sessionController`、`workspaceRegistry`、`sessionPersistence` 三个服务（官方 `dsh-base` 都有）；有 `commands` 服务时才会注册斜杠命令，没有也不影响工具。
 
 ## 开发与测试
 

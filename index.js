@@ -1,20 +1,24 @@
 /**
  * dsh-handoff — model-facing session handoff for DeepSeek Harness.
  *
- * One tool, three steps:
+ * One tool, two history policies:
  *
- *   1. **fork**  — `ctx.sessionController.fork()` copies this session's exact
- *      event prefix into a brand-new, independent session (no `parentSession`,
- *      so the sidebar and the resumable set keep showing it).
- *   2. **move**  — the fork is relocated into the target workspace: the stored
- *      log's header is rewritten, the live write handle is re-pinned, and the
- *      workspace ledger is swapped. Nothing restarts; the new session appears in
- *      the target workspace while the source keeps running untouched.
- *   3. **brief** — the handoff summary the model wrote is appended to the new
- *      session as its first message, so the next reader starts with both the
- *      full history and a compact brief.
+ *   **full** (default) — `ctx.sessionController.fork()` copies this session's
+ *   exact event prefix into a brand-new, independent session (no
+ *   `parentSession`, so the sidebar and the resumable set keep showing it),
+ *   then relocates it into the target workspace: the stored log's header is
+ *   rewritten, the live write handle is re-pinned, and the workspace ledger is
+ *   swapped. Nothing restarts.
  *
- * The source session is never modified: this is a copy, not a move.
+ *   **summary** — nothing is copied. `ctx.sessionController.create()` opens a
+ *   blank session directly in the target workspace and only the handoff brief
+ *   is written into it. This is the escape hatch when the source history is
+ *   too large to carry (for example when a plugin with no proactive compaction
+ *   keeps the context saturated): a fork would inherit that pressure and be
+ *   unusable, while a summary-only session starts clean.
+ *
+ * In both modes the brief is appended as the new session's first message, and
+ * the source session is never modified.
  */
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
@@ -40,7 +44,16 @@ const PARAMETERS = {
       type: "string",
       description:
         "The handoff brief recorded as the new session's first message. Write it in the user's language and cover: the overall goal, decisions already made, what is done, what remains, files/directories touched, and any gotchas or verification the next session must know. " +
-        "It supplements the copied history, so keep it compact (a few hundred words) and do not repeat what is obvious from the transcript."
+        "With history=summary this brief is the ONLY thing the new session receives, so it must stand on its own — say which files to reopen and what to re-check. With history=full it supplements the copied transcript, so keep it compact (a few hundred words) and do not repeat what is obvious from the transcript."
+    },
+    history: {
+      type: "string",
+      enum: ["full", "summary"],
+      description:
+        "How much of this conversation the new session carries. " +
+        "full (default) copies the complete event history — use it whenever the target session needs exact context and the source is still healthy. " +
+        "summary copies NOTHING and starts the target from the brief alone — use it when the source history is already enormous or the context is nearly exhausted (a plugin without proactive compaction, repeated compaction failures, or a user who explicitly asks for 只写总结 / summary only). " +
+        "A fork inherits the source's context pressure, so handing a saturated session off with full history can leave the new session unable to continue; when in doubt on a very long conversation, prefer summary."
     },
     mode: {
       type: "string",
@@ -70,6 +83,7 @@ const RESULT_SCHEMA = {
     workspacePath: { type: "string" },
     workspaceTitle: { type: "string" },
     workspaceCreated: { type: "boolean" },
+    history: { type: "string", enum: ["full", "summary"] },
     title: { type: "string" },
     copiedEvents: { type: "number" },
     briefAttached: { type: "boolean" },
@@ -167,6 +181,64 @@ export function apply(ctx) {
     `Full history above was copied verbatim; this brief is the summary written at handoff time.\n\n` +
     summary;
 
+  const buildSummaryOnlyBrief = (sourceId, sourceCwd, summary) =>
+    `【Handoff 交接简报（仅摘要） / handoff brief — summary only】\n` +
+    `From session ${sourceId} (workspace ${sourceCwd}).\n` +
+    `The full history was NOT copied: this session starts from this brief alone. Files are still on disk at the paths below — reopen what this brief names before changing anything.\n\n` +
+    summary;
+
+  /**
+   * summary-only handoff: a blank session in the target workspace, plus the brief.
+   *
+   * Nothing is forked, so the new session starts with an empty context instead
+   * of inheriting a saturated one, and `create()` writes it straight into the
+   * target workspace — no relocation, no working-directory fix-up.
+   */
+  const handoffSummaryOnly = async ({ controller, workspace, workspaceCreated, source, sourceId, summary, args, exec }) => {
+    const created = await controller.create({ workspaceId: workspace.id });
+    const childId = created?.sessionId;
+    if (typeof childId !== "string" || childId.length === 0) {
+      throw new Error("handoff: the session controller did not return a new session id");
+    }
+
+    let appliedTitle;
+    const requestedTitle = typeof args?.title === "string" ? args.title.trim() : "";
+    if (requestedTitle.length > 0) {
+      try {
+        const renamed = await controller.rename({ sessionId: childId, title: requestedTitle });
+        appliedTitle = typeof renamed?.title === "string" ? renamed.title : requestedTitle;
+      } catch (error) {
+        log.warn?.(`dsh-handoff: renaming ${childId} failed, keeping the generated title: ${String(error)}`);
+      }
+    }
+
+    const child = ctx.sessions.get(childId);
+    const { briefAttached, turnStarted } = await attachBrief({
+      controller,
+      sessionId: childId,
+      session: child,
+      text: buildSummaryOnlyBrief(sourceId, source.header.cwd, summary),
+      startTurn: args?.start_turn === true,
+      signal: exec.signal ?? new AbortController().signal
+    });
+
+    log.info?.(`dsh-handoff: ${sourceId} handed off (summary only) to ${childId} in ${workspace.path}`);
+    return {
+      sessionId: childId,
+      workspacePath: workspace.path,
+      workspaceTitle: String(workspace.title ?? basename(workspace.path)),
+      workspaceCreated,
+      history: "summary",
+      ...(appliedTitle === undefined ? {} : { title: appliedTitle }),
+      briefAttached,
+      turnStarted,
+      cwdSynced: "synced",
+      note:
+        `已在工作区「${workspace.title}」(${workspace.path}) 新建会话 ${childId}，它只带着交接简报、没有复制历史。` +
+        `原会话保持不变；如果新会话需要精确上下文，可以改用 history=full 重新交接。`
+    };
+  };
+
   /** Queue a relocation of the calling session; it runs when the current turn ends. */
   const pendingMoves = new Map();
   const settleMove = async (session) => {
@@ -206,7 +278,8 @@ export function apply(ctx) {
   const handoffTool = {
     name: "handoff_session",
     description:
-      "Hand off this conversation to another workspace. It copies this session's COMPLETE history into a brand-new session located in the target directory, then records the handoff brief you write as that session's first message — so work continues there with full context plus a summary, while this session stays exactly as it is. " +
+      "Hand off this conversation to another workspace. By default it copies this session's COMPLETE history into a brand-new session located in the target directory, then records the handoff brief you write as that session's first message — so work continues there with full context plus a summary, while this session stays exactly as it is. " +
+      "With history=summary nothing is copied: the new session starts from your brief alone, which is the right choice when this conversation is already too large to carry (a fork inherits the source's context pressure, so a saturated session handed off with full history can leave the new session unable to continue). " +
       "Use it whenever the user wants to continue this work somewhere else: 交接 / 转交 / 迁移 / 搬到 / 复制到 / 换个工作区继续 / move & continue in another repo / hand this off to another project / start a new session there with everything. " +
       "Prefer it over manually copying files, re-explaining the context, or telling the user to start a blank session: those lose the history this tool carries. " +
       "The new session is created live — no restart needed; the user just opens it from the target workspace in the sidebar.",
@@ -227,6 +300,13 @@ export function apply(ctx) {
       const summary = typeof args?.summary === "string" ? args.summary.trim() : "";
       if (target.length === 0) throw new Error("handoff: `target` must be a non-empty workspace path, id, or title");
       if (summary.length === 0) throw new Error("handoff: `summary` must be a non-empty handoff brief");
+      const history = args?.history === "summary" ? "summary" : "full";
+      if (history === "summary" && args?.mode === "move") {
+        throw new Error(
+          "handoff: history=summary cannot be combined with mode=move — move relocates this session itself (with its full history) at the end of the turn. " +
+          "Use mode=copy (the default) for a summary-only handoff, or drop history=summary to move this session."
+        );
+      }
 
       const agent = exec.agent;
       const sourceId = agent?.session?.id ?? exec.sessionId;
@@ -238,7 +318,7 @@ export function apply(ctx) {
         throw new Error("handoff: this session has no recorded working directory to hand off from");
       }
 
-      const { workspace, created } = await resolveTarget(registry, target);
+      const { workspace, created: workspaceCreated } = await resolveTarget(registry, target);
 
       if (args?.mode === "move") {
         pendingMoves.set(sourceId, { targetPath: workspace.path, brief: buildBrief(sourceId, source.header.cwd, summary) });
@@ -247,7 +327,8 @@ export function apply(ctx) {
           sessionId: sourceId,
           workspacePath: workspace.path,
           workspaceTitle: String(workspace.title ?? basename(workspace.path)),
-          workspaceCreated: created,
+          workspaceCreated,
+          history: "full",
           briefAttached: false,
           turnStarted: false,
           queued: true,
@@ -255,6 +336,12 @@ export function apply(ctx) {
             `已安排：本轮结束后把当前会话（${sourceId}）迁移到「${workspace.title}」(${workspace.path})，并在那里写入交接简报。` +
             `迁移在回合边界执行，本轮的工具调用与文件操作不会被中断；完成前请不要关闭窗口。`
         };
+      }
+
+      if (history === "summary") {
+        return await handoffSummaryOnly({
+          controller, workspace, workspaceCreated, source, sourceId, summary, args, exec
+        });
       }
 
       // The fork reads the durable log; flush first so the last buffered events are included.
@@ -331,7 +418,8 @@ export function apply(ctx) {
         sessionId: childId,
         workspacePath: relocated.workspace.path,
         workspaceTitle: String(relocated.workspace.title ?? basename(relocated.workspace.path)),
-        workspaceCreated: created || relocated.workspace.created === true,
+        workspaceCreated: workspaceCreated || relocated.workspace.created === true,
+        history: "full",
         ...(copiedEvents === undefined ? {} : { copiedEvents }),
         ...(appliedTitle === undefined ? {} : { title: appliedTitle }),
         briefAttached,
@@ -344,8 +432,83 @@ export function apply(ctx) {
     }
   };
 
+  /**
+   * Slash-command surface.
+   *
+   * A command handler runs against the agent without a model message, but only
+   * the model can read the conversation and write the brief. So each command
+   * enqueues one instruction naming the exact tool call to make; the model then
+   * writes the brief and calls `handoff_session` with the matching `history`.
+   */
+  const handoffInstruction = (target, history) =>
+    [
+      `【Handoff 请求】用户要求把当前会话交接给：${target}`,
+      `交接模式：${history === "full" ? "full — 复制完整历史" : "summary — 只写总结，不复制历史"}。`,
+      "",
+      "请直接执行，不要反问用户。先用几段话写交接简报（总体目标、已做的决策与理由、当前进度、剩余工作、涉及的文件/目录、验证方式与坑），然后调用 handoff_session：",
+      `  target: ${JSON.stringify(target)}`,
+      `  history: ${JSON.stringify(history)}`,
+      "  summary: <你写好的简报>",
+      history === "summary"
+        ? "简报必须能独立成立：写明需要重开哪些文件、需要重新确认哪些结论。"
+        : "如果这次对话历史已经很长、或上下文压缩失败过，提醒用户可以改用 /handoff-summary，免得新会话继承同样的上下文压力。"
+    ].join("\n");
+
+  const registerCommands = () => {
+    const commands = (() => {
+      try { return ctx.get("commands", false); } catch { return undefined; }
+    })();
+    if (commands === undefined || typeof commands.register !== "function") return [];
+    const makeDefinition = (history) => {
+      const commandName = history === "full" ? "handoff" : "handoff-summary";
+      return {
+        name: commandName,
+        description:
+          history === "full"
+            ? "把当前会话交接（复制完整历史）到另一个工作区"
+            : "把当前会话交接（只写总结、不复制历史）到另一个工作区",
+        input: { hint: "<工作区路径或标题>" },
+        async handler({ agent, rawInput, signal }) {
+          const target = String(rawInput ?? "").trim();
+          if (target.length === 0) {
+            return { kind: "error", text: `用法：/${commandName} <工作区路径或标题>` };
+          }
+          const controller = (() => {
+            try { return ctx.get("sessionController", false); } catch { return undefined; }
+          })();
+          const sessionId = agent?.session?.id ?? agent?.id;
+          if (controller === undefined || typeof sessionId !== "string") {
+            return { kind: "error", text: "handoff: 会话控制器不可用，无法发起交接。" };
+          }
+          try {
+            await controller.prompt(
+              {
+                requestId: randomUUID(),
+                sessionId,
+                mode: "queue",
+                content: [{ type: "text", text: handoffInstruction(target, history) }]
+              },
+              signal
+            );
+          } catch (error) {
+            return {
+              kind: "error",
+              text: `handoff: 无法把交接请求交给 Agent：${error instanceof Error ? error.message : String(error)}`
+            };
+          }
+          return {
+            kind: "success",
+            text: `已提交交接请求（${history === "full" ? "复制完整历史" : "仅摘要"}）→ ${target}；Agent 写完简报后会创建新会话。`
+          };
+        }
+      };
+    };
+    return [commands.register(makeDefinition("full")), commands.register(makeDefinition("summary"))];
+  };
+
   const disposers = [
     ctx.tools.register(handoffTool),
+    ...registerCommands(),
     ctx.on("session/event", (session, event) => {
       if (event?.type === "turn/end") void settleMove(session);
     })
