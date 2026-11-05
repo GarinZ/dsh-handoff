@@ -440,19 +440,24 @@ export function apply(ctx) {
    * enqueues one instruction naming the exact tool call to make; the model then
    * writes the brief and calls `handoff_session` with the matching `history`.
    */
-  const handoffInstruction = (target, history) =>
-    [
-      `【Handoff 请求】用户要求把当前会话交接给：${target}`,
-      `交接模式：${history === "full" ? "full — 复制完整历史" : "summary — 只写总结，不复制历史"}。`,
+  const handoffInstruction = (request, history) => {
+    const modeLine = history === "full" ? "full — 复制完整历史" : "summary — 只写总结，不复制历史";
+    return [
+      "【Handoff 请求】用户在斜杠命令后写了一段自然语言要求，它同时说明了要交接去哪里、以及简报该重点写什么：",
+      "----",
+      request.length > 0 ? request : "（用户没有写具体要求：请根据这次对话判断最合适的目标工作区；实在判断不出来就问用户。）",
+      "----",
+      `交接模式：${modeLine}。`,
       "",
-      "请直接执行，不要反问用户。先用几段话写交接简报（总体目标、已做的决策与理由、当前进度、剩余工作、涉及的文件/目录、验证方式与坑），然后调用 handoff_session：",
-      `  target: ${JSON.stringify(target)}`,
-      `  history: ${JSON.stringify(history)}`,
-      "  summary: <你写好的简报>",
+      "请按三步执行：",
+      "1. 确定目标工作区：从上面这段话里读出来的地点优先；没写就结合对话内容和现有工作区挑最合适的一个；仍然无法确定时用 ask_user_question 问用户，不要猜。target 可以是绝对路径（或 ~ 开头）、工作区标题、或工作区 id。",
+      "2. 写交接简报：总体目标、已做的决策与理由、当前进度、剩余工作、涉及的文件/目录、验证方式与坑；用户在上面点名的重点必须写进去。",
+      "3. 调用 handoff_session：target 用第 1 步的结果，history 用上面的模式，summary 用第 2 步的简报；用户提到标题或是否立即开跑时，再传 title / start_turn。",
       history === "summary"
-        ? "简报必须能独立成立：写明需要重开哪些文件、需要重新确认哪些结论。"
-        : "如果这次对话历史已经很长、或上下文压缩失败过，提醒用户可以改用 /handoff-summary，免得新会话继承同样的上下文压力。"
+        ? "summary 模式下简报是新会话唯一的信息来源：必须自包含，写明要重开哪些文件、重新确认哪些结论。"
+        : "如果这次对话已经很长、或上下文压缩失败过，提醒用户可以改用 /handoff-summary，免得新会话继承同样的上下文压力。"
     ].join("\n");
+  };
 
   const registerCommands = () => {
     const commands = (() => {
@@ -465,14 +470,11 @@ export function apply(ctx) {
         name: commandName,
         description:
           history === "full"
-            ? "把当前会话交接（复制完整历史）到另一个工作区"
-            : "把当前会话交接（只写总结、不复制历史）到另一个工作区",
-        input: { hint: "<工作区路径或标题>" },
+            ? "交接当前会话（复制完整历史）到另一个工作区：用自然语言说明去哪、简报重点写什么"
+            : "交接当前会话（只写总结、不复制历史）到另一个工作区：用自然语言说明去哪、简报重点写什么",
+        input: { hint: "<自然语言：交接去哪里、简报重点>" },
         async handler({ agent, rawInput, signal }) {
-          const target = String(rawInput ?? "").trim();
-          if (target.length === 0) {
-            return { kind: "error", text: `用法：/${commandName} <工作区路径或标题>` };
-          }
+          const request = String(rawInput ?? "").trim();
           const controller = (() => {
             try { return ctx.get("sessionController", false); } catch { return undefined; }
           })();
@@ -486,7 +488,7 @@ export function apply(ctx) {
                 requestId: randomUUID(),
                 sessionId,
                 mode: "queue",
-                content: [{ type: "text", text: handoffInstruction(target, history) }]
+                content: [{ type: "text", text: handoffInstruction(request, history) }]
               },
               signal
             );
@@ -498,7 +500,7 @@ export function apply(ctx) {
           }
           return {
             kind: "success",
-            text: `已提交交接请求（${history === "full" ? "复制完整历史" : "仅摘要"}）→ ${target}；Agent 写完简报后会创建新会话。`
+            text: `已提交交接请求（${history === "full" ? "复制完整历史" : "仅摘要"}）。Agent 会先确定目标工作区、写好简报，再创建新会话。`
           };
         }
       };
