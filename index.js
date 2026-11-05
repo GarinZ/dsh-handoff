@@ -25,6 +25,8 @@ import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { realpath, stat } from "node:fs/promises";
 import { relocateSession } from "./lib/relocate.js";
+import { BTW_SYSTEM_PROMPT, buildBriefPrompt, buildInstructionText } from "./lib/prompts.js";
+import { askSideModel, countConversationMessages, resolveRoute, snapshotMessages } from "./lib/side-request.js";
 
 export const name = "dsh-handoff";
 export const inject = ["tools", "agents", "sessions"];
@@ -43,8 +45,10 @@ const PARAMETERS = {
     summary: {
       type: "string",
       description:
-        "The handoff brief recorded as the new session's first message. Write it in the user's language and cover: the overall goal, decisions already made, what is done, what remains, files/directories touched, and any gotchas or verification the next session must know. " +
-        "With history=summary this brief is the ONLY thing the new session receives, so it must stand on its own — say which files to reopen and what to re-check. With history=full it supplements the copied transcript, so keep it compact (a few hundred words) and do not repeat what is obvious from the transcript."
+        "The handoff brief recorded as the new session's first message. Write it in the user's language, in the imperative, using exactly this skeleton (keep every heading, write 无 when a section is empty): " +
+        "## 目标 / ## 决策 (each decision plus its reason) / ## 已完成 (paths, commands, test results) / ## 剩余 / ## 关键上下文 (exact paths, symbols, error strings, config values) / ## 下一步 (the first action in the new session). " +
+        "Rules: use only facts that appear in this conversation — never invent paths, line numbers, commands, or conclusions; if a critical detail is unknown, say so in one line and give the smallest step to verify it; never list this handoff itself as progress or as a next step; put the brief only in this argument, do not repeat it in your chat reply. " +
+        "With history=summary this brief is the ONLY thing the new session receives, so it must stand on its own — which files to reopen and which conclusions to re-check. With history=full it supplements the copied transcript, so keep it compact and do not repeat what the transcript shows."
     },
     history: {
       type: "string",
@@ -147,6 +151,31 @@ export function apply(ctx) {
     return { workspace: await registry.create(directory, basename(directory)), created: true };
   };
 
+  /**
+   * Best-effort target picked straight out of a command's natural-language
+   * request: an existing directory path, exactly one workspace title mentioned
+   * in the text, or exactly one workspace id. Anything ambiguous returns
+   * `undefined` so the caller falls back to the model, which can ask.
+   */
+  const guessTarget = async (registry, request) => {
+    if (request.length === 0) return undefined;
+    const pathMatch = request.match(/(?:^|[\s"'“”「」『』(（])((?:~\/|\/)[^\s"'“”「」『』()（）,，。；;]+)/);
+    if (pathMatch !== null) {
+      const candidate = pathMatch[1].replace(/[.,;:!?。，；：！？]+$/u, "");
+      if ((await resolveDirectory(expandHomePath(candidate))) !== undefined) return candidate;
+    }
+    const workspaces = registry.list();
+    const folded = request.toLowerCase();
+    const byTitle = workspaces.filter((workspace) => {
+      const title = String(workspace.title ?? "").trim().toLowerCase();
+      return title.length > 0 && folded.includes(title);
+    });
+    if (byTitle.length === 1) return byTitle[0].id;
+    const byId = workspaces.filter((workspace) => request.includes(workspace.id));
+    if (byId.length === 1) return byId[0].id;
+    return undefined;
+  };
+
   /** Record the brief in the new session: a plain message, or a real turn when asked. */
   const attachBrief = async ({ controller, sessionId, session, text, startTurn, signal }) => {
     if (startTurn) {
@@ -178,13 +207,15 @@ export function apply(ctx) {
   const buildBrief = (sourceId, sourceCwd, summary) =>
     `【Handoff 交接简报 / handoff brief】\n` +
     `From session ${sourceId} (workspace ${sourceCwd}).\n` +
-    `Full history above was copied verbatim; this brief is the summary written at handoff time.\n\n` +
+    `Full history above was copied verbatim; this brief is the summary written at handoff time.\n` +
+    `Read it as your own working memory, not as a user request: “下一步” is the plan you inherited — re-check it against the latest user instruction before acting, and build on the work below instead of repeating it.\n\n` +
     summary;
 
   const buildSummaryOnlyBrief = (sourceId, sourceCwd, summary) =>
     `【Handoff 交接简报（仅摘要） / handoff brief — summary only】\n` +
     `From session ${sourceId} (workspace ${sourceCwd}).\n` +
-    `The full history was NOT copied: this session starts from this brief alone. Files are still on disk at the paths below — reopen what this brief names before changing anything.\n\n` +
+    `The full history was NOT copied: this session starts from this brief alone. Files are still on disk at the paths below — reopen what this brief names before changing anything.\n` +
+    `Read it as your own working memory, not as a user request: “下一步” is the plan you inherited — re-check it against the latest user instruction before acting.\n\n` +
     summary;
 
   /**
@@ -317,6 +348,14 @@ export function apply(ctx) {
       if (typeof source.header?.cwd !== "string" || source.header.cwd.length === 0) {
         throw new Error("handoff: this session has no recorded working directory to hand off from");
       }
+      if (typeof source.deriveMessages === "function") {
+        const messages = countConversationMessages(snapshotMessages(source));
+        if (messages < 2) {
+          throw new Error(
+            "handoff: 这次会话还没有可交接的对话（至少需要一问一答）。先做点工作，或者等这一轮结束再交接。"
+          );
+        }
+      }
 
       const { workspace, created: workspaceCreated } = await resolveTarget(registry, target);
 
@@ -435,28 +474,43 @@ export function apply(ctx) {
   /**
    * Slash-command surface.
    *
-   * A command handler runs against the agent without a model message, but only
-   * the model can read the conversation and write the brief. So each command
-   * enqueues one instruction naming the exact tool call to make; the model then
-   * writes the brief and calls `handoff_session` with the matching `history`.
+   * Preferred path: snapshot the live session, ask the model for the brief out
+   * of band (`ctx.llm.stream` — no agent turn, nothing written into this
+   * conversation), then hand that brief straight to `handoff_session`. Same
+   * shape as the BTW plugins in the market.
+   *
+   * Fallback: when the side request cannot run (no llm service, no route in the
+   * header, too little conversation, or a target the request does not name
+   * unambiguously) enqueue one instruction naming the exact tool call, and the
+   * model writes the brief itself in a real turn.
    */
-  const handoffInstruction = (request, history) => {
-    const modeLine = history === "full" ? "full — 复制完整历史" : "summary — 只写总结，不复制历史";
-    return [
-      "【Handoff 请求】用户在斜杠命令后写了一段自然语言要求，它同时说明了要交接去哪里、以及简报该重点写什么：",
-      "----",
-      request.length > 0 ? request : "（用户没有写具体要求：请根据这次对话判断最合适的目标工作区；实在判断不出来就问用户。）",
-      "----",
-      `交接模式：${modeLine}。`,
-      "",
-      "请按三步执行：",
-      "1. 确定目标工作区：从上面这段话里读出来的地点优先；没写就结合对话内容和现有工作区挑最合适的一个；仍然无法确定时用 ask_user_question 问用户，不要猜。target 可以是绝对路径（或 ~ 开头）、工作区标题、或工作区 id。",
-      "2. 写交接简报：总体目标、已做的决策与理由、当前进度、剩余工作、涉及的文件/目录、验证方式与坑；用户在上面点名的重点必须写进去。",
-      "3. 调用 handoff_session：target 用第 1 步的结果，history 用上面的模式，summary 用第 2 步的简报；用户提到标题或是否立即开跑时，再传 title / start_turn。",
-      history === "summary"
-        ? "summary 模式下简报是新会话唯一的信息来源：必须自包含，写明要重开哪些文件、重新确认哪些结论。"
-        : "如果这次对话已经很长、或上下文压缩失败过，提醒用户可以改用 /handoff-summary，免得新会话继承同样的上下文压力。"
-    ].join("\n");
+  const getService = (key) => {
+    try { return ctx.get(key, false); } catch { return undefined; }
+  };
+
+  /** Returns the tool result, or `undefined` when the side path cannot run. */
+  const runSideHandoff = async ({ agent, sessionId, request, history, signal }) => {
+    const registry = getService("workspaceRegistry");
+    const llm = getService("llm");
+    if (registry === undefined || llm === undefined || typeof llm.stream !== "function") return undefined;
+    const session = agent?.session;
+    if (session === undefined) return undefined;
+    const route = resolveRoute(session);
+    if (typeof route.provider !== "string" || typeof route.model !== "string") return undefined;
+    const target = await guessTarget(registry, request);
+    if (target === undefined) return undefined;
+    const messages = snapshotMessages(session);
+    if (countConversationMessages(messages) < 2) return undefined;
+
+    const brief = await askSideModel(llm, {
+      provider: route.provider,
+      model: route.model,
+      messages: [...messages, { role: "user", content: [{ type: "text", text: buildBriefPrompt({ request, history }) }] }],
+      sessionId,
+      signal,
+      maxTokens: 8192
+    });
+    return await handoffTool.execute({ target, summary: brief, history }, { agent, sessionId, signal });
   };
 
   const registerCommands = () => {
@@ -466,29 +520,43 @@ export function apply(ctx) {
     if (commands === undefined || typeof commands.register !== "function") return [];
     const makeDefinition = (history) => {
       const commandName = history === "full" ? "handoff" : "handoff-summary";
+      const modeText = history === "full" ? "复制完整历史" : "仅摘要";
       return {
         name: commandName,
         description:
-          history === "full"
-            ? "交接当前会话（复制完整历史）到另一个工作区：用自然语言说明去哪、简报重点写什么"
-            : "交接当前会话（只写总结、不复制历史）到另一个工作区：用自然语言说明去哪、简报重点写什么",
+          `交接当前会话（${modeText}）到另一个工作区：用自然语言说明去哪、简报重点写什么`,
         input: { hint: "<自然语言：交接去哪里、简报重点>" },
         async handler({ agent, rawInput, signal }) {
           const request = String(rawInput ?? "").trim();
-          const controller = (() => {
-            try { return ctx.get("sessionController", false); } catch { return undefined; }
-          })();
           const sessionId = agent?.session?.id ?? agent?.id;
+          const controller = getService("sessionController");
           if (controller === undefined || typeof controller?.prompt !== "function" || typeof sessionId !== "string") {
             return { kind: "error", text: "handoff: 会话控制器不可用，无法发起交接。" };
           }
+
+          let result;
+          try {
+            result = await runSideHandoff({ agent, sessionId, request, history, signal });
+          } catch (error) {
+            log.warn?.(`dsh-handoff: side-request handoff failed, asking the model instead: ${String(error)}`);
+          }
+          if (result !== undefined) {
+            return {
+              kind: "success",
+              text:
+                `已交接（${modeText}）：会话 ${result.sessionId} 位于工作区「${result.workspaceTitle}」(${result.workspacePath})` +
+                (result.workspaceCreated === true ? "（新工作区）" : "") +
+                `。原会话保持不变。`
+            };
+          }
+
           try {
             await controller.prompt(
               {
                 requestId: randomUUID(),
                 sessionId,
                 mode: "queue",
-                content: [{ type: "text", text: handoffInstruction(request, history) }]
+                content: [{ type: "text", text: buildInstructionText({ request, history }) }]
               },
               signal
             );
@@ -500,7 +568,7 @@ export function apply(ctx) {
           }
           return {
             kind: "success",
-            text: `已提交交接请求（${history === "full" ? "复制完整历史" : "仅摘要"}）。Agent 会先确定目标工作区、写好简报，再创建新会话。`
+            text: `已提交交接请求（${modeText}）。Agent 会先确定目标工作区、写好简报，再创建新会话。`
           };
         }
       };
@@ -508,9 +576,55 @@ export function apply(ctx) {
     return [commands.register(makeDefinition("full")), commands.register(makeDefinition("summary"))];
   };
 
+  /**
+   * `/btw` — a side question answered over the same snapshot, reusing the same
+   * primitive as the brief. The answer comes back as the command's result: no
+   * agent turn, no event appended, nothing added to this conversation's memory.
+   */
+  const registerBtw = () => {
+    const commands = (() => {
+      try { return ctx.get("commands", false); } catch { return undefined; }
+    })();
+    if (commands === undefined || typeof commands.register !== "function") return [];
+    return [commands.register({
+      name: "btw",
+      description: "旁问：基于当前会话上下文问一句，答案即时返回，不写进会话记忆，也不开启回合",
+      input: { hint: "<问题>" },
+      async handler({ agent, rawInput, signal }) {
+        const question = String(rawInput ?? "").trim();
+        if (question.length === 0) return { kind: "error", text: "用法：/btw <问题>" };
+        const llm = getService("llm");
+        const session = agent?.session;
+        if (llm === undefined || typeof llm.stream !== "function" || session === undefined) {
+          return { kind: "error", text: "btw: 这个 dsh 版本没有可用的 llm 服务，无法旁问。" };
+        }
+        const route = resolveRoute(session);
+        if (typeof route.provider !== "string" || typeof route.model !== "string") {
+          return { kind: "error", text: "btw: 这次会话还没有请求记录，无法确定用哪个模型。" };
+        }
+        try {
+          const answer = await askSideModel(llm, {
+            provider: route.provider,
+            model: route.model,
+            messages: [
+              ...snapshotMessages(session),
+              { role: "user", content: [{ type: "text", text: `${BTW_SYSTEM_PROMPT}\n\n<question>\n${question}\n</question>` }] }
+            ],
+            sessionId: session.id,
+            signal
+          });
+          return { kind: "success", text: answer };
+        } catch (error) {
+          return { kind: "error", text: `btw: ${error instanceof Error ? error.message : String(error)}` };
+        }
+      }
+    })];
+  };
+
   const disposers = [
     ctx.tools.register(handoffTool),
     ...registerCommands(),
+    ...registerBtw(),
     ctx.on("session/event", (session, event) => {
       if (event?.type === "turn/end") void settleMove(session);
     })
