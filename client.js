@@ -20,6 +20,17 @@ window.__ModuleLoader__.load({
     const h = React.createElement
     const { useEffect, useState, useSyncExternalStore } = React
 
+    // The composer establishes a containing block (backdrop-filter and friends),
+    // so a position:fixed card rendered inside it would anchor to the composer
+    // instead of the viewport. Portal to the body when react-dom is reachable.
+    let ReactDOM = null
+    try {
+      ReactDOM = require('react-dom')
+    } catch {
+      // No react-dom in this shell: the card still renders, anchored to whatever
+      // containing block it lands in.
+    }
+
     let MarkdownText = null
     try {
       MarkdownText = require('@deepseek-ai/dsh-client-ui-primitives').MarkdownText ?? null
@@ -114,7 +125,7 @@ window.__ModuleLoader__.load({
       const running = activity.status === 'running'
       const isBtw = activity.kind === 'btw'
 
-      return h('div', { className: 'handoff-card', key: 'handoff-card' }, [
+      const card = h('div', { className: 'handoff-card', key: 'handoff-card' }, [
         h('div', { className: 'handoff-card-head', key: 'head' }, [
           h('span', { className: 'handoff-card-title', key: 'title' },
             `${activity.title || (isBtw ? '旁问' : '侧路请求')}${running ? '' : activity.status === 'error' ? ' · 失败' : ' · 完成'}`),
@@ -149,6 +160,8 @@ window.__ModuleLoader__.load({
           ])
           : null
       ])
+
+      return ReactDOM?.createPortal ? ReactDOM.createPortal(card, document.body) : card
     }
 
     return {

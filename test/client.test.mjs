@@ -16,10 +16,12 @@ const react = {
   useMemo: (factory) => factory()
 };
 
+let loads = 0;
+
 const loadClient = async () => {
   let module;
   globalThis.window = { __ModuleLoader__: { load: (value) => { module = value } } };
-  await import(`../client.js?t=${Date.now()}`);
+  await import(`../client.js?t=${++loads}`);
   return module;
 };
 
@@ -29,11 +31,29 @@ const require_ = (name) => {
   throw new Error(`unexpected require: ${name}`);
 };
 
+/** Same loader contract, but with react-dom present (the shipped shell has it). */
+const requireWithPortal = (name) => {
+  if (name === "react-dom") return { createPortal: (node, container) => ({ node, container }) };
+  return require_(name);
+};
+
 test("the client module registers through the shell loader under the package id", async () => {
   const module = await loadClient();
   assert.equal(module.id, "@garinz/dsh-handoff");
   const exports = module.factory(require_);
   assert.deepEqual(exports.inject, ["slots"]);
+  assert.equal(typeof exports.apply, "function");
+});
+
+test("a shell without react-dom still materializes the client half", async () => {
+  const module = await loadClient();
+  const exports = module.factory(require_);
+  assert.equal(typeof exports.apply, "function");
+});
+
+test("a shell with react-dom is accepted (the card portals to the body)", async () => {
+  const module = await loadClient();
+  const exports = module.factory(requireWithPortal);
   assert.equal(typeof exports.apply, "function");
 });
 
