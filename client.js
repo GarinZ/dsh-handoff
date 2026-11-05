@@ -63,6 +63,10 @@ window.__ModuleLoader__.load({
       }
     }
 
+    // Filled in by `apply`: a follow-up question is just another slash command,
+    // so the card can hand it to the same remote path the composer uses.
+    const followUp = { execute: null }
+
     let pollGeneration = 0
 
     function poll(sessionId) {
@@ -89,6 +93,19 @@ window.__ModuleLoader__.load({
       setTimeout(tick, 120)
     }
 
+    function askFollowUp(sessionId, question) {
+      const text = String(question ?? '').trim()
+      if (text.length === 0 || typeof followUp.execute !== 'function') return false
+      try {
+        followUp.execute(sessionId, `btw ${text}`)
+      } catch {
+        return false
+      }
+      // The host replaces the slot; restart the loop so the card follows it.
+      poll(sessionId)
+      return true
+    }
+
     function cancel(sessionId) {
       if (!sessionId) return
       fetch(`/handoff/activity?session=${encodeURIComponent(sessionId)}&cancel=1`, { cache: 'no-store' }).catch(() => {})
@@ -112,6 +129,7 @@ window.__ModuleLoader__.load({
       const state = useSyncExternalStore(store.subscribe, store.get)
       const activity = state.activity
       const [, tick] = useState(0)
+      const [draft, setDraft] = useState('')
 
       useEffect(() => {
         if (activity?.status !== 'running') return undefined
@@ -149,6 +167,38 @@ window.__ModuleLoader__.load({
           : running
             ? h('div', { className: 'handoff-card-body handoff-card-waiting', key: 'body' }, '正在等待模型返回…')
             : null,
+        isBtw
+          ? h('form', {
+            className: 'handoff-card-followup',
+            key: 'followup',
+            onSubmit: (event) => {
+              event.preventDefault()
+              if (askFollowUp(state.sessionId, draft)) setDraft('')
+            }
+          }, [
+            h('input', {
+              key: 'input',
+              className: 'handoff-card-input',
+              placeholder: '继续追问…',
+              value: draft,
+              onChange: (event) => setDraft(event.target.value),
+              onKeyDown: (event) => {
+                // The composer behind the card owns Enter for its own draft.
+                if (event.key === 'Enter' && !event.shiftKey) {
+                  event.stopPropagation()
+                  event.preventDefault()
+                  if (askFollowUp(state.sessionId, draft)) setDraft('')
+                }
+              }
+            }),
+            h('button', {
+              key: 'send',
+              type: 'submit',
+              className: 'handoff-card-btn handoff-card-send',
+              disabled: draft.trim().length === 0
+            }, '追问')
+          ])
+          : null,
         running && isBtw
           ? h('div', { className: 'handoff-card-foot', key: 'foot' }, [
             h('button', {
@@ -165,8 +215,17 @@ window.__ModuleLoader__.load({
     }
 
     return {
-      inject: ['slots'],
+      inject: ['slots', 'remote'],
       apply(ctx) {
+        try {
+          const remote = ctx.remote ?? ctx.get?.('remote')
+          if (remote?.commands?.execute) {
+            followUp.execute = (sessionId, line) => remote.commands.execute(sessionId, line, [])
+          }
+        } catch {
+          // No remote service: the follow-up input simply stays inert.
+        }
+
         ctx.effect(() => {
           const style = document.createElement('style')
           style.textContent = [
@@ -191,7 +250,15 @@ window.__ModuleLoader__.load({
             '.handoff-card-body{overflow:auto;max-height:38vh;user-select:text;-webkit-user-select:text;}',
             '.handoff-card-waiting{opacity:0.6;}',
             '.handoff-card-error{color:#c0392b;}',
-            '.handoff-card-foot{display:flex;justify-content:flex-end;}'
+            '.handoff-card-foot{display:flex;justify-content:flex-end;}',
+            '.handoff-card-followup{display:flex;gap:6px;border-top:1px solid rgba(128,128,128,0.22);padding-top:8px;}',
+            '.handoff-card-input{flex:1 1 auto;min-width:0;height:26px;padding:0 8px;border-radius:7px;',
+            'border:1px solid rgba(128,128,128,0.35);background:rgba(255,255,255,0.9);color:inherit;',
+            'font:inherit;font-size:12.5px;outline:none;}',
+            '.handoff-card-input:focus{border-color:rgba(0,122,255,0.7);}',
+            '@media (prefers-color-scheme:dark){.handoff-card-input{background:rgba(255,255,255,0.06);}}',
+            '.handoff-card-send{height:26px;padding:0 10px;font-size:12px;opacity:0.9;}',
+            '.handoff-card-send:disabled{opacity:0.35;cursor:default;}'
           ].join('')
           document.head.appendChild(style)
           return () => style.remove()

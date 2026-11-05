@@ -41,7 +41,7 @@ test("the client module registers through the shell loader under the package id"
   const module = await loadClient();
   assert.equal(module.id, "@garinz/dsh-handoff");
   const exports = module.factory(require_);
-  assert.deepEqual(exports.inject, ["slots"]);
+  assert.deepEqual(exports.inject, ["slots", "remote"]);
   assert.equal(typeof exports.apply, "function");
 });
 

@@ -25,7 +25,7 @@ import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { realpath, stat } from "node:fs/promises";
 import { relocateSession } from "./lib/relocate.js";
-import { BTW_SYSTEM_PROMPT, buildBriefPrompt, buildInstructionText } from "./lib/prompts.js";
+import { BTW_SYSTEM_PROMPT, buildBriefPrompt, buildInstructionText, buildSideThread } from "./lib/prompts.js";
 import {
   askSideModel,
   buildTranscript,
@@ -144,6 +144,16 @@ export function apply(ctx) {
    * so it stays visible while the conversation streams.
    */
   const activity = createActivityStore();
+  // Side answers live outside the session history, so keep the last few pairs
+  // in memory: a follow-up ("那第二步呢？") otherwise starts from nothing.
+  const btwThreads = new Map();
+  const BTW_THREAD_LIMIT = 12;
+  const rememberBtw = (sessionId, question, answer) => {
+    const thread = btwThreads.get(sessionId) ?? [];
+    thread.push({ question, answer });
+    while (thread.length > BTW_THREAD_LIMIT) thread.shift();
+    btwThreads.set(sessionId, thread);
+  };
 
   /** Resolve the Handoff to the workspace the user named: id, exact title, or directory. */
   const resolveTarget = async (registry, raw) => {
@@ -623,6 +633,12 @@ export function apply(ctx) {
    */
   const btwMessages = (session) => buildTranscript(snapshotMessages(session), { maxChars: 200_000 });
 
+  const btwPrompt = (session, question) => [
+    `<conversation>\n${btwMessages(session).text}\n</conversation>`,
+    buildSideThread(btwThreads.get(session.id)),
+    `<question>\n${question}\n</question>`
+  ].filter((part) => part.length > 0).join("\n\n");
+
   const describeHandoff = (result, modeText) =>
     `已交接（${modeText}）：会话 ${result.sessionId} 位于工作区「${result.workspaceTitle}」(${result.workspacePath})` +
     (result.workspaceCreated === true ? "（新工作区）" : "") +
@@ -752,10 +768,7 @@ export function apply(ctx) {
               system: BTW_SYSTEM_PROMPT,
               messages: [{
                 role: "user",
-                content: [{
-                  type: "text",
-                  text: `<conversation>\n${btwMessages(session).text}\n</conversation>\n\n<question>\n${question}\n</question>`
-                }]
+                content: [{ type: "text", text: btwPrompt(session, question) }]
               }],
               sessionId: session.id,
               signal,
@@ -764,6 +777,7 @@ export function apply(ctx) {
             const answer = answered.finishKind === "max-tokens"
               ? `${answered.text}\n\n（回答达到输出长度上限，已截断）`
               : answered.text;
+            rememberBtw(session.id, question, answer);
             activity.finish(session.id, entry.id, "done", { text: answer });
             return answer;
           } catch (error) {
@@ -785,16 +799,14 @@ export function apply(ctx) {
               system: BTW_SYSTEM_PROMPT,
               messages: [{
                 role: "user",
-                content: [{
-                  type: "text",
-                  text: `<conversation>\n${btwMessages(session).text}\n</conversation>\n\n<question>\n${question}\n</question>`
-                }]
+                content: [{ type: "text", text: btwPrompt(session, question) }]
               }],
               sessionId: session.id
             });
             const answer = answered.finishKind === "max-tokens"
               ? `${answered.text}\n\n（回答达到输出长度上限，已截断）`
               : answered.text;
+            rememberBtw(session.id, question, answer);
             return { kind: "success", text: answer };
           } catch (error) {
             return { kind: "error", text: `btw: ${error instanceof Error ? error.message : String(error)}` };

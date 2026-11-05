@@ -226,3 +226,23 @@ test("the handoff command returns at once and reports the background failure lat
   assert.equal(late.data.kind, "error");
   assert.ok(late.data.text.length > 0, "the failure must be reported in the command node");
 });
+
+test("/btw remembers earlier side answers so a follow-up can build on them", async () => {
+  const llm = fakeLlm("第一问的答案。");
+  const host = makeHost({ llm });
+  apply(host.ctx);
+  const btw = findCommand(host.commands, "btw");
+  const session = fakeSession({ append: () => ({}) });
+  const agent = { id: "session-abc", session };
+
+  await btw.handler({ agent, rawInput: "第一步是什么？", commandId: "cmd-1", signal: undefined });
+  await settle();
+  host.emit(session, { type: "command/done", data: { commandId: "cmd-1", kind: "success", text: "占位" } });
+
+  await btw.handler({ agent, rawInput: "那第二步呢？", commandId: "cmd-2", signal: undefined });
+  const prompt = llm.calls.at(-1).messages[0].content[0].text;
+  assert.ok(prompt.includes("<earlier-side-questions>"), "the second question carries the first Q&A");
+  assert.ok(prompt.includes("第一步是什么？"));
+  assert.ok(prompt.includes("第一问的答案。"));
+  assert.ok(prompt.includes("<question>\n那第二步呢？"));
+});
