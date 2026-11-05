@@ -591,7 +591,7 @@ export function apply(ctx) {
   };
 
   const executeSideHandoff = async (plan, { agent, sessionId, request, history, signal, onBriefDelta, onPhase }) => {
-    const brief = await askSideModel(plan.llm, {
+    const answered = await askSideModel(plan.llm, {
       provider: plan.route.provider,
       model: plan.route.model,
       system: buildBriefPrompt({
@@ -606,9 +606,12 @@ export function apply(ctx) {
       }],
       sessionId,
       signal,
-      maxTokens: 8192,
+      maxTokens: 12_000,
       onDelta: onBriefDelta
     });
+    const brief = answered.finishKind === "max-tokens"
+      ? `${answered.text}\n\n> 简报达到输出长度上限（max-tokens），末尾被截断。`
+      : answered.text;
     onPhase?.("正在创建会话…");
     const result = await handoffTool.execute({ target: plan.target, summary: brief, history }, { agent, sessionId, signal });
     return { result, brief };
@@ -744,7 +747,7 @@ export function apply(ctx) {
         const entry = activity.begin(session.id, { kind: "btw", title: "旁问", question });
         const scheduled = scheduleLateResult(invocation, placeholder, async (signal) => {
           try {
-            const answer = await askSideModel(llm, {
+            const answered = await askSideModel(llm, {
               provider: route.provider,
               model: route.model,
               system: BTW_SYSTEM_PROMPT,
@@ -757,9 +760,12 @@ export function apply(ctx) {
               }],
               sessionId: session.id,
               signal,
-              maxTokens: 2000,
+              maxTokens: 8_000,
               onDelta: (text) => activity.update(session.id, entry.id, { text })
             });
+            const answer = answered.finishKind === "max-tokens"
+              ? `${answered.text}\n\n（回答达到输出长度上限，已截断）`
+              : answered.text;
             activity.finish(session.id, entry.id, "done", { text: answer });
             return answer;
           } catch (error) {
@@ -775,7 +781,7 @@ export function apply(ctx) {
         if (!scheduled) {
           // No command id (an adapted caller): answer inline, accepting the wait.
           try {
-            const answer = await askSideModel(llm, {
+            const answered = await askSideModel(llm, {
               provider: route.provider,
               model: route.model,
               system: BTW_SYSTEM_PROMPT,
@@ -787,8 +793,11 @@ export function apply(ctx) {
                 }]
               }],
               sessionId: session.id,
-              maxTokens: 2000
+              maxTokens: 8_000
             });
+            const answer = answered.finishKind === "max-tokens"
+              ? `${answered.text}\n\n（回答达到输出长度上限，已截断）`
+              : answered.text;
             return { kind: "success", text: answer };
           } catch (error) {
             return { kind: "error", text: `btw: ${error instanceof Error ? error.message : String(error)}` };

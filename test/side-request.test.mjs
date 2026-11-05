@@ -56,7 +56,7 @@ test("askSideModel joins text deltas and forwards the route", async () => {
     { type: "text-delta", text: "lo" },
     { type: "finish", reason: { kind: "stop" } }
   ]);
-  const answer = await askSideModel(llm, {
+  const { text: answer } = await askSideModel(llm, {
     provider: "deepseek-official",
     model: "deepseek-flash",
     messages: [{ role: "user", content: [] }],
@@ -126,4 +126,15 @@ test("buildTranscript keeps the newest entries inside the character budget", () 
   assert.ok(text.startsWith("（更早的 1 条消息已省略）"));
   assert.ok(text.includes("new"));
   assert.ok(!text.includes("old"));
+});
+
+test("askSideModel reports a max-tokens finish instead of hiding the cut", async () => {
+  const chunks = [
+    { type: "text-delta", text: "half of an answer" },
+    { type: "finish", reason: { kind: "max-tokens" } }
+  ];
+  const llm = { stream: async function* () { for (const chunk of chunks) yield chunk; } };
+  const result = await askSideModel(llm, { provider: "p", model: "m", messages: [] });
+  assert.equal(result.text, "half of an answer");
+  assert.equal(result.finishKind, "max-tokens");
 });
