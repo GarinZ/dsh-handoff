@@ -33,7 +33,11 @@ fork 是**事实复制**，不是压缩：源会话如果已经被上下文压�
 
 `history: "summary"` 于是干脆不复制事件：直接在目标工作区新建一个空白会话，把简报写进去。新会话的上下文压力从零开始，代价是丢掉了原始对话里的细节（工具输出、文件内容、原话）。
 
-简报会被包进一个**只含简报、不含模型回复的回合**里（`turn/start` → 简报 → `turn/end`）。这不是为了好看：GUI 用 `sessionListMetadata.blank` 判断「这个会话是否已经开张」，而该投影只在遇到 `turn/start` 时才会翻成 `false`；不补这个回合，仅摘要交接出来的会话就只是一个隐藏的「未开始」占位，侧边栏里根本看不到。回合里没有 step，也没有 assistant 消息，所以不会调用模型、不会跑工具。
+仅摘要交接出来的会话需要至少一个回合才能出现在侧边栏里：GUI 用 `sessionListMetadata.blank` 判断「这个会话是否已经开张」，而该投影只在遇到 `turn/start` 时才翻成 `false`；没有回合的会话只是一个隐藏的「未开始」占位。
+
+这个空回合由 **agent loop 自己开**，不是插件手写。插件把简报当普通 prompt 入队，在 `agent/pre-step` 里把该回合 claim 到的消息放回 `next-step`，并返回 `{ kind: "enter", messages: [] }`；loop 自己的规则（`phase.step === 0 && decision.messages.length === 0`）随即把回合以 `completed` 关闭——没有 step、不调用模型、不跑工具，日志里只会多一条 `turn/start`/`turn/end`。简报留在 inbox 里，等用户的第一条真实消息把它一起带进下一个回合。
+
+> **不要手写这个回合。** 0.6.2 及更早版本直接 `append("turn/start", { turn: 1 })`，随后用户发消息时 loop 又写了一次 `turn=1`（loop 构造时缓存了 `lastTurn`，看不到插件后补的回合），读取器便以 `turn/start does not open the expected turn` 判定日志损坏、整个会话打不开。若简报写成 surface 消息、排在 loop 的第一条 `system/message` 之前，还会触发 `system/message requires a protected first surface head`。
 
 ## 安装
 

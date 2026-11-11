@@ -36,6 +36,7 @@ import {
 } from "./lib/side-request.js";
 import { createActivityRoute, createActivityStore, readJsonBody } from "./lib/activity.js";
 import { appendBrief } from "./lib/brief-append.js";
+import { openVisibleTurn } from "./lib/visible-turn.js";
 
 export const name = "dsh-handoff";
 export const inject = ["tools", "agents", "sessions"];
@@ -219,20 +220,14 @@ export function apply(ctx) {
   };
 
   /**
-   * Record the brief in the new session: a plain message, or a real turn when
-   * asked.
+   * Record the brief on a forked session's surface: a plain message, or a real
+   * turn when asked.
    *
-   * `ensureVisible` wraps the brief in a closed turn of its own. The GUI decides
-   * whether a Session exists by reading the `sessionListMetadata.blank`
-   * projection, which only `turn/start` clears (`dsh-api-session-controller`
-   * `applySessionListMetadata`: `blank: state.blank && event.type !==
-   * 'turn/start'`). A summary-only handoff creates a session with no turns at
-   * all, so without this it stays a hidden "new conversation" placeholder even
-   * though its log already holds the brief. The turn carries no step and no
-   * assistant message — the loop itself closes turns with no step when the input
-   * was empty or rejected — so nothing is sent to a model.
+   * The copied history already supplied the surface's protected head, so a
+   * bare user message is legal here. Summary-only handoffs never take this
+   * path — see `openVisibleTurn` in ./lib/visible-turn.js.
    */
-  const attachBrief = async ({ controller, sessionId, session, text, startTurn, ensureVisible, signal }) => {
+  const attachBrief = async ({ controller, sessionId, session, text, startTurn, signal }) => {
     if (startTurn) {
       await controller.prompt(
         { requestId: randomUUID(), sessionId, mode: "queue", content: [{ type: "text", text }] },
@@ -242,7 +237,7 @@ export function apply(ctx) {
     }
     if (session !== undefined && typeof session.append === "function") {
       try {
-        appendBrief(session, text, { ensureVisible, messageId: randomUUID() });
+        appendBrief(session, text, { messageId: randomUUID() });
         return { briefAttached: true, turnStarted: false };
       } catch (error) {
         log.warn?.(`dsh-handoff: direct brief append failed, falling back to a prompt: ${String(error)}`);
@@ -295,15 +290,36 @@ export function apply(ctx) {
     }
 
     const child = ctx.sessions.get(childId);
-    const { briefAttached, turnStarted } = await attachBrief({
-      controller,
-      sessionId: childId,
-      session: child,
-      text: buildSummaryOnlyBrief(sourceId, source.header.cwd, summary),
-      startTurn: args?.start_turn === true,
-      ensureVisible: true,
-      signal: exec.signal ?? new AbortController().signal
-    });
+    const briefText = buildSummaryOnlyBrief(sourceId, source.header.cwd, summary);
+    const signal = exec.signal ?? new AbortController().signal;
+    let briefAttached = true;
+    let turnStarted = false;
+    if (args?.start_turn === true) {
+      // A real first turn: the loop opens it and the brief is its first message.
+      await controller.prompt(
+        { requestId: randomUUID(), sessionId: childId, mode: "queue", content: [{ type: "text", text: briefText }] },
+        signal
+      );
+      turnStarted = true;
+    } else if (typeof ctx.on === "function") {
+      // Let the loop open, and immediately close, an empty turn: the session
+      // stops being a hidden placeholder and the brief waits in the inbox for
+      // the user's first real message instead of preceding the system message.
+      try {
+        const visible = await openVisibleTurn({ ctx, controller, sessionId: childId, text: briefText, signal });
+        if (!visible.opened) {
+          log.warn?.(`dsh-handoff: ${childId} did not close its visibility turn (${visible.reason})`);
+        }
+      } catch (error) {
+        log.warn?.(`dsh-handoff: ${childId} could not open its visibility turn: ${String(error)}`);
+        briefAttached = false;
+      }
+    } else if (typeof child?.append === "function") {
+      // Host without the loop hooks: the brief is the only thing to record.
+      appendBrief(child, briefText, { messageId: randomUUID() });
+    } else {
+      throw new Error("handoff: this host can neither drive a turn nor append the brief");
+    }
 
     log.info?.(`dsh-handoff: ${sourceId} handed off (summary only) to ${childId} in ${workspace.path}`);
     return {

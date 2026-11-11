@@ -2,12 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { appendBrief } from "../lib/brief-append.js";
 
-/** A Session stand-in that records appends and serves a fixed prior log. */
-const fakeSession = (events = []) => {
+/** A Session stand-in that records appends. */
+const fakeSession = () => {
   const appended = [];
   return {
     appended,
-    snapshotEvents: () => events,
     append: (type, data, opts) => {
       appended.push({ type, data, opts });
       return { type, data, seq: appended.length - 1 };
@@ -15,41 +14,31 @@ const fakeSession = (events = []) => {
   };
 };
 
-test("a fresh session gets a closed turn so the list stops hiding it", () => {
+test("the brief is one surface user message", () => {
   const session = fakeSession();
-  const result = appendBrief(session, "brief", { ensureVisible: true });
-  assert.equal(result.openedTurn, true);
-  assert.deepEqual(
-    session.appended.map((event) => event.type),
-    ["turn/start", "user/message", "turn/end"]
-  );
-  assert.deepEqual(session.appended[0].data, { turn: 1 });
-  assert.deepEqual(session.appended[2].data, { turn: 1, reason: { kind: "completed" } });
-  assert.deepEqual(session.appended[1].opts, { surfaceOp: "append" });
-  assert.equal(session.appended[1].data.content[0].text, "brief");
-});
-
-test("a forked session that already has turns is not wrapped again", () => {
-  const session = fakeSession([{ type: "turn/start", data: { turn: 1 } }]);
-  const result = appendBrief(session, "brief", { ensureVisible: true });
-  assert.equal(result.openedTurn, false);
+  const result = appendBrief(session, "brief", { messageId: "msg-1" });
+  assert.equal(result.appended, true);
   assert.deepEqual(
     session.appended.map((event) => event.type),
     ["user/message"]
   );
+  assert.equal(session.appended[0].data.id, "msg-1");
+  assert.equal(session.appended[0].data.content[0].text, "brief");
+  assert.deepEqual(session.appended[0].opts, { surfaceOp: "append" });
 });
 
-test("without ensureVisible the brief stays a bare message", () => {
+test("the brief carries an id when the caller supplies none", () => {
   const session = fakeSession();
   appendBrief(session, "brief");
-  assert.deepEqual(
-    session.appended.map((event) => event.type),
-    ["user/message"]
-  );
+  assert.equal(typeof session.appended[0].data.id, "string");
+  assert.ok(session.appended[0].data.id.length > 0);
 });
 
-test("the brief keeps a caller-supplied message id", () => {
+test("no turn is fabricated around the brief", () => {
+  // A fabricated turn/start would disagree with the agent loop's cached turn
+  // number and a surface brief would precede the loop's system message; both
+  // corrupt the stored log.
   const session = fakeSession();
-  appendBrief(session, "brief", { messageId: "msg-1" });
-  assert.equal(session.appended[0].data.id, "msg-1");
+  appendBrief(session, "brief");
+  assert.ok(!session.appended.some((event) => event.type === "turn/start"));
 });
