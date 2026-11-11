@@ -37,7 +37,7 @@ fork 是**事实复制**，不是压缩：源会话如果已经被上下文压�
 
 这个空回合由 **agent loop 自己开**，不是插件手写。插件把简报当普通 prompt 入队，在 `agent/pre-step` 里把该回合 claim 到的消息放回 `next-step`，并返回 `{ kind: "enter", messages: [] }`；loop 自己的规则（`phase.step === 0 && decision.messages.length === 0`）随即把回合以 `completed` 关闭——没有 step、不调用模型、不跑工具，日志里只会多一条 `turn/start`/`turn/end`。简报留在 inbox 里，等用户的第一条真实消息把它一起带进下一个回合。
 
-> **不要手写这个回合。** 0.6.2 及更早版本直接 `append("turn/start", { turn: 1 })`，随后用户发消息时 loop 又写了一次 `turn=1`（loop 构造时缓存了 `lastTurn`，看不到插件后补的回合），读取器便以 `turn/start does not open the expected turn` 判定日志损坏、整个会话打不开。若简报写成 surface 消息、排在 loop 的第一条 `system/message` 之前，还会触发 `system/message requires a protected first surface head`。
+> **不要手写这个回合。** 0.6.2 及更早版本直接 `append("turn/start", { turn: 1 })`，随后用户发消息时 loop 又写了一次 `turn=1`（loop 构造时缓存了 `lastTurn`，看不到插件后补的回合），读取器便以 `turn/start does not open the expected turn` 判定日志损坏、整个会话打不开。若简报写成 surface 消息、排在 loop 的第一条 `system/message` 之前，还会触发 `system/message requires a protected first surface head`。两条约束的完整说明与排查方法见 [`docs/session-log-invariants.md`](docs/session-log-invariants.md)。
 
 ## 安装
 
@@ -205,8 +205,12 @@ npm test        # node --test test/*.test.mjs
 - `test/activity.test.mjs` — 进度槽的流式写入、过期回调防覆盖、`/handoff/activity` 路由与取消。
 - `test/client.test.mjs` — 通过 `window.__ModuleLoader__.load` 加载客户端半并 apply，验证浮层（`slots.inject`）与命令监听注册。
 - `test/plugin.test.mjs` — 三个命令的注册、`/btw` 的侧路回答与延迟回填、后台交接成功/失败的回填、控制器缺失时的错误返回、尚不存在的目标目录走快路径。
+- `test/brief-append.test.mjs` — fork 路径只写一条 surface `user/message`，任何情况下都不伪造回合。
+- `test/visible-turn.test.mjs` — 空回合由 loop 关闭、简报回到 `next-step`、钩子与监听器全部释放、他人会话放行、超时与 prompt 被拒的分支。
 
 单元测试只覆盖宿主半的编排，**碰不到真实浏览器**。客户端链路（浮层是否出现、追问按钮的 POST）用 `docs/smoke-ui.md` 里的一套隔离宿主 + agent-browser 流程手工验证，改动客户端半后请按它跑一遍。
+
+往会话里写事件之前，先读 [`docs/session-log-invariants.md`](docs/session-log-invariants.md)：回合号必须由 agent loop 连续分配，surface 的第一个节点必须是 loop 的 `system/message`。违反任何一条都会让整个会话在下次加载时被判损坏（0.6.2 的教训）。
 
 ## 许可与致谢
 
