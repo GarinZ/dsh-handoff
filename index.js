@@ -36,6 +36,15 @@ import {
 } from "./lib/side-request.js";
 import { createActivityRoute, createActivityStore, readJsonBody } from "./lib/activity.js";
 import { appendBrief } from "./lib/brief-append.js";
+import {
+  REFUSE_RATIO,
+  WARN_RATIO,
+  contextRatio,
+  describeMeasure,
+  measureContext,
+  percent,
+  readContextWindow
+} from "./lib/context-size.js";
 import { openVisibleTurn } from "./lib/visible-turn.js";
 
 export const name = "dsh-handoff";
@@ -425,6 +434,27 @@ export function apply(ctx) {
         }
       }
 
+      // Refuse the copy before it is made. A session whose body already fills
+      // the window produces a clone whose first request is stopped at the
+      // egress fuse — after the whole upload has been paid for. Milliseconds
+      // here beat minutes there.
+      let contextNotice;
+      if (history === "full" && typeof source.deriveMessages === "function") {
+        const measure = measureContext(snapshotMessages(source));
+        const window = readContextWindow(source);
+        const ratio = contextRatio(measure, window);
+        if (ratio >= REFUSE_RATIO) {
+          throw new Error(
+            `handoff: 这个会话已经占掉约 ${percent(ratio)} 的上下文窗口（${describeMeasure(measure, window)}），` +
+            "已经装不下一次完整的请求了。全文复制只会把同样的体积搬进新会话——新会话第一轮就会被 provider 的 egress fuse 拦下（就是 `outbound body ... exceeds the window` 那一类失败）。" +
+            "请改用 history=\"summary\"（/handoff-summary）：只带简报过去，新会话从零开始，原会话保持不变。"
+          );
+        }
+        if (ratio >= WARN_RATIO) {
+          contextNotice = `（注意：源会话已占约 ${percent(ratio)} 的窗口，新会话可用的余量不多）`;
+        }
+      }
+
       const { workspace, created: workspaceCreated } = await resolveTarget(registry, target);
 
       if (args?.mode === "move") {
@@ -534,7 +564,8 @@ export function apply(ctx) {
         cwdSynced,
         note:
           `已把当前会话的完整历史复制到新会话 ${childId}，它现在位于工作区「${relocated.workspace.title}」(${relocated.workspace.path})` +
-          `，并附上了交接简报。原会话保持不变；用户在目标工作区的侧栏里打开新会话即可继续。`
+          `，并附上了交接简报。原会话保持不变；用户在目标工作区的侧栏里打开新会话即可继续。` +
+          (contextNotice === undefined ? "" : contextNotice)
       };
     }
   };
@@ -641,16 +672,30 @@ export function apply(ctx) {
     // not worth it. Flatten to text, newest messages first in the budget.
     const transcript = buildTranscript(messages, { maxChars: 400_000 });
     if (transcript.text.length === 0) return undefined;
-    return { llm, session, route, target, transcript };
+    // Same refusal as the tool, but a command cannot ask a question: fall back
+    // to the summary handoff and say why, rather than starting a copy that is
+    // guaranteed to die on its first turn.
+    let effectiveHistory = history;
+    let downgraded = false;
+    if (history === "full") {
+      const measure = measureContext(messages);
+      const window = readContextWindow(session);
+      if (contextRatio(measure, window) >= REFUSE_RATIO) {
+        effectiveHistory = "summary";
+        downgraded = true;
+      }
+    }
+    return { llm, session, route, target, transcript, history: effectiveHistory, downgraded };
   };
 
-  const executeSideHandoff = async (plan, { agent, sessionId, request, history, signal, onBriefDelta, onPhase }) => {
+  const executeSideHandoff = async (plan, { agent, sessionId, request, signal, onBriefDelta, onPhase }) => {
+    const effectiveHistory = plan.history ?? "full";
     const answered = await askSideModel(plan.llm, {
       provider: plan.route.provider,
       model: plan.route.model,
       system: buildBriefPrompt({
         request,
-        history,
+        history: effectiveHistory,
         truncated: plan.transcript.truncated,
         dropped: plan.transcript.dropped
       }),
@@ -666,7 +711,10 @@ export function apply(ctx) {
       ? `${answered.text}\n\n> 简报达到输出长度上限（max-tokens），末尾被截断。`
       : answered.text;
     onPhase?.("正在创建会话…");
-    const result = await handoffTool.execute({ target: plan.target, summary: brief, history }, { agent, sessionId, signal });
+    const result = await handoffTool.execute(
+      { target: plan.target, summary: brief, history: effectiveHistory },
+      { agent, sessionId, signal }
+    );
     return { result, brief };
   };
 
@@ -793,11 +841,12 @@ export function apply(ctx) {
           // inside the handler: the composer would hold the draft until it lands.
           const plan = await planSideHandoff({ agent, sessionId, request, history });
           if (plan !== undefined) {
-            const placeholder = `正在生成简报并交接（${modeText}）…`;
+            const effectiveModeText = plan.downgraded === true ? "仅摘要（源会话过大，已自动降级）" : modeText;
+            const placeholder = `正在生成简报并交接（${effectiveModeText}）…`;
             const entry = activity.begin(sessionId, {
               kind: "handoff",
-              title: `交接简报（${modeText}）`,
-              phase: "正在写简报…",
+              title: `交接简报（${effectiveModeText}）`,
+              phase: plan.downgraded === true ? "源会话已接近窗口上限，改用仅摘要…" : "正在写简报…",
               target: plan.target
             });
             const scheduled = scheduleLateResult(invocation, placeholder, async (lateSignal) => {
@@ -806,12 +855,11 @@ export function apply(ctx) {
                   agent,
                   sessionId,
                   request,
-                  history,
                   signal: lateSignal,
                   onBriefDelta: (text) => activity.update(sessionId, entry.id, { phase: "正在写简报…", text }),
                   onPhase: (phase) => activity.update(sessionId, entry.id, { phase })
                 });
-                const text = describeHandoff(result, modeText);
+                const text = describeHandoff(result, effectiveModeText);
                 activity.finish(sessionId, entry.id, "done", { phase: "", text });
                 return text;
               } catch (error) {
@@ -823,7 +871,7 @@ export function apply(ctx) {
               }
             }, {
               onController: (controller) => activity.track(sessionId, controller),
-              failurePrefix: `交接失败（${modeText}）`
+              failurePrefix: `交接失败（${effectiveModeText}）`
             });
             if (scheduled) return { kind: "success", text: `${placeholder}完成后会更新这条结果。` };
           }

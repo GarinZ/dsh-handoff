@@ -348,3 +348,55 @@ test("POST /handoff/ask rejects an unknown session", async () => {
   await ask.handler(fakeRequest({ session: "nope", question: "hi" }), res);
   assert.equal(res.status, 404);
 });
+
+/** A session whose snapshot alone is already past 80% of the window. */
+const oversizedSession = () => {
+  const huge = "字".repeat(900_000);
+  return fakeSession({
+    id: "session-big",
+    header: { cwd: "/tmp/big" },
+    append: () => {},
+    deriveMessages: () => [
+      { role: "user", content: [{ type: "text", text: huge }] },
+      { role: "assistant", content: [{ type: "text", text: "ok" }] }
+    ]
+  });
+};
+
+test("a full handoff refuses a session that already fills the window", async () => {
+  const session = oversizedSession();
+  const host = makeHost({
+    sessionController: {},
+    workspaceRegistry: {},
+    sessionPersistence: {},
+    sessions: { get: () => session }
+  });
+  apply(host.ctx);
+
+  await assert.rejects(
+    () => host.tools[0].execute(
+      { target: "/tmp/out", summary: "brief", history: "full" },
+      { agent: { session }, sessionId: session.id }
+    ),
+    /占掉约 90%[\s\S]*egress fuse/
+  );
+});
+
+test("the full command downgrades to a summary handoff instead of copying a doomed session", async () => {
+  const session = oversizedSession();
+  const llm = fakeLlm("## 目标\n- 降级跑通");
+  const host = makeHost({ llm, workspaceRegistry: { list: () => [] }, sessions: { get: () => session } });
+  apply(host.ctx);
+
+  const full = findCommand(host.commands, "handoff");
+  const result = await full.handler({
+    commandId: "cmd-downgrade",
+    agent: { session },
+    rawInput: "/tmp/handoff-downgrade",
+    signal: undefined
+  });
+
+  assert.equal(result.kind, "success");
+  assert.ok(result.text.includes("自动降级"), `expected a downgrade notice, got: ${result.text}`);
+  await settle();
+});

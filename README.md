@@ -39,6 +39,26 @@ fork 是**事实复制**，不是压缩：源会话如果已经被上下文压�
 
 > **不要手写这个回合。** 0.6.2 及更早版本直接 `append("turn/start", { turn: 1 })`，随后用户发消息时 loop 又写了一次 `turn=1`（loop 构造时缓存了 `lastTurn`，看不到插件后补的回合），读取器便以 `turn/start does not open the expected turn` 判定日志损坏、整个会话打不开。若简报写成 surface 消息、排在 loop 的第一条 `system/message` 之前，还会触发 `system/message requires a protected first surface head`。两条约束的完整说明与排查方法见 [`docs/session-log-invariants.md`](docs/session-log-invariants.md)。
 
+### 超限的会话不复制
+
+`outbound body measures ~2,855,805 tokens … the body ITSELF exceeds the window` 这类报错不是交接逻辑坏了，而是**被交接的那个会话本身**已经装不下一次请求：provider 在发送前把整个 body 量和窗口比一遍，超了就整包退回。全文复制会把同样的体积原样搬进新会话，于是新会话第一轮就死在同一个地方——你花了很久跑完的交接，换来的还是一个跑不动的会话。
+
+所以插件在动手之前先量一遍（`lib/context-size.js`）：文字按 CJK 加权、图片按视觉预算（像素/750）折算成 token，再和会话的窗口比。
+
+- ≥ 80%：**直接拒绝**，报错里给出具体数字和该走的路，不 fork、不建目录、不花时间。
+- 50%–80%：照做，但在结果里提醒余量不多。
+- 斜杠命令不能反问，所以 `/handoff` 撞上 80% 时**自动降级成仅摘要**，并在卡片和结果里写明降级原因。
+
+<div align="center">
+
+| 源会话占用 | `handoff_session`（模型调用） | `/handoff`（斜杠命令） |
+| --- | --- | --- |
+| < 50% | 复制 | 复制 |
+| 50%–80% | 复制，附余量提醒 | 复制，附余量提醒 |
+| ≥ 80% | 拒绝，提示改用 `history:"summary"` | 自动降级为仅摘要 |
+
+</div>
+
 ## 安装
 
 ```bash
