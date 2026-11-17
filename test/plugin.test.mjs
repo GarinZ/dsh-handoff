@@ -187,7 +187,7 @@ test("/btw answers over a snapshot without prompting the agent", async () => {
   const [call] = llm.calls;
   assert.equal(call.provider, "deepseek-official");
   assert.equal(call.model, "deepseek-flash");
-  assert.equal(call.sessionId, "session-abc");
+  assert.equal(call.sessionId, undefined, "a session id makes the adapter attach the whole attachment store");
   // The request is flattened: rules go in `system`, the transcript and the
   // question travel as one user message (structured history is what providers
   // reject when no tools are declared).

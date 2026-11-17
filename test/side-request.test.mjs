@@ -66,7 +66,7 @@ test("askSideModel joins text deltas and forwards the route", async () => {
   assert.equal(answer, "hello");
   assert.equal(llm.request.provider, "deepseek-official");
   assert.equal(llm.request.model, "deepseek-flash");
-  assert.equal(llm.request.sessionId, "session-1");
+  assert.equal(llm.request.sessionId, undefined, "a session id makes the adapter attach the whole attachment store");
   assert.equal(llm.request.maxTokens, 100);
   assert.equal(Object.hasOwn(llm.request, "system"), false);
 });
