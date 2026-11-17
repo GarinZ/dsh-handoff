@@ -84,15 +84,39 @@ test("apply registers one tool and three slash commands", () => {
   assert.ok(inject.includes("sessions"));
 });
 
-test("a command without a target explains what to write instead of spending an agent turn", async () => {
-  const host = makeHost({ llm: fakeLlm("unused") });
+test("a command with no argument hands off inside the current workspace", async () => {
+  const llm = fakeLlm("## 目标\n- 原地重开");
+  const host = makeHost({ llm, workspaceRegistry: { list: () => [] } });
   apply(host.ctx);
   const summary = findCommand(host.commands, "handoff-summary");
-  const result = await summary.handler({ agent: { id: "session-abc" }, rawInput: "   ", signal: undefined });
+  const session = fakeSession({ id: "session-abc", header: { cwd: "/tmp/current-ws" }, append: () => ({}) });
+  const result = await summary.handler({
+    agent: { session },
+    rawInput: "   ",
+    commandId: "cmd-empty",
+    signal: undefined
+  });
+
+  assert.equal(result.kind, "success");
+  assert.ok(result.text.includes("仅摘要"), result.text);
+  assert.equal(host.prompts.length, 0, "no turn may be queued: a saturated session dies there");
+  assert.equal(llm.calls.length, 1, "the side request writes the brief");
+});
+
+test("a description that names no readable target is still an error", async () => {
+  const host = makeHost({ llm: fakeLlm("unused"), workspaceRegistry: { list: () => [] } });
+  apply(host.ctx);
+  const session = fakeSession({ header: { cwd: "/tmp/current-ws" }, append: () => ({}) });
+  const result = await findCommand(host.commands, "handoff").handler({
+    agent: { session },
+    rawInput: "交接给那个我们之前说过的仓库",
+    commandId: "cmd-bad",
+    signal: undefined
+  });
 
   assert.equal(result.kind, "error");
-  assert.ok(result.text.includes("/handoff-summary ~/work/some-repo"), result.text);
-  assert.equal(host.prompts.length, 0, "no turn may be queued: a saturated session dies there");
+  assert.ok(result.text.includes("认不出目标工作区"), result.text);
+  assert.equal(host.prompts.length, 0);
 });
 
 test("the full command runs the side request once it has a path", async () => {

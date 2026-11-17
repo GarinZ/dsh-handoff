@@ -668,16 +668,23 @@ export function apply(ctx) {
     }
     const registry = getService("workspaceRegistry");
     if (registry === undefined) return { reason: "宿主里没有 workspaceRegistry 服务。" };
-    const target = await guessTarget(registry, request);
+    const session = agent?.session;
+    if (session === undefined) return { reason: "拿不到当前会话。" };
+    const named = await guessTarget(registry, request);
+    // No description at all is not an error: the common zero-argument intent
+    // is "this conversation is full, give me a fresh one with a summary", and
+    // that fresh session belongs in the workspace we are already in. A
+    // description that names a target we cannot read is still an error — we do
+    // not silently ignore what the user typed.
+    const fallbackTarget = request.length === 0 ? session.header?.cwd : undefined;
+    const target = named ?? (typeof fallbackTarget === "string" && fallbackTarget.length > 0 ? fallbackTarget : undefined);
     if (target === undefined) {
       return {
         reason: request.length === 0
-          ? `这条命令需要一个目标：/${history === "full" ? "handoff" : "handoff-summary"} ~/work/some-repo（后面可以再写一句简报重点）。`
+          ? "拿不到当前工作区目录，没法默认交接回本工作区；请写目标（路径 / 标题 / id）。"
           : "认不出目标工作区：请写绝对路径（或 ~ 开头）、工作区标题、或工作区 id。"
       };
     }
-    const session = agent?.session;
-    if (session === undefined) return { reason: "拿不到当前会话。" };
     const route = resolveRoute(session);
     if (typeof route.provider !== "string" || typeof route.model !== "string") {
       return { reason: "这次会话还没有请求记录，无法确定用哪个模型写简报。" };
@@ -704,7 +711,13 @@ export function apply(ctx) {
         downgraded = true;
       }
     }
-    return { plan: { llm, session, route, target, transcript, history: effectiveHistory, downgraded } };
+    return {
+      plan: {
+        llm, session, route, target, transcript,
+        history: effectiveHistory, downgraded,
+        defaultTarget: named === undefined
+      }
+    };
   };
 
   const executeSideHandoff = async (plan, { agent, sessionId, request, signal, onBriefDelta, onPhase }) => {
@@ -829,9 +842,10 @@ export function apply(ctx) {
     return reply(200, { ok: true, activity: entry });
   };
 
-  const describeHandoff = (result, modeText) =>
+  const describeHandoff = (result, modeText, { defaultTarget = false } = {}) =>
     `已交接（${modeText}）：会话 ${result.sessionId} 位于工作区「${result.workspaceTitle}」(${result.workspacePath})` +
     (result.workspaceCreated === true ? "（新工作区）" : "") +
+    (defaultTarget ? "（没写目标，默认交接回当前工作区）" : "") +
     "。原会话保持不变。";
 
   const registerCommands = () => {
@@ -845,8 +859,8 @@ export function apply(ctx) {
       return {
         name: commandName,
         description:
-          `交接当前会话（${modeText}）到另一个工作区：用自然语言说明去哪、简报重点写什么`,
-        input: { hint: "<自然语言：交接去哪里、简报重点>" },
+          `交接当前会话（${modeText}）：可选的自然语言说明去哪、简报重点写什么；不写就交接回当前工作区`,
+        input: { hint: "<可选：交接去哪里、简报重点>" },
         async handler(invocation) {
           const { agent, rawInput } = invocation;
           const request = String(rawInput ?? "").trim();
@@ -880,7 +894,7 @@ export function apply(ctx) {
                 onBriefDelta: (text) => activity.update(sessionId, entry.id, { phase: "正在写简报…", text }),
                 onPhase: (phase) => activity.update(sessionId, entry.id, { phase })
               });
-              const text = describeHandoff(result, effectiveModeText);
+              const text = describeHandoff(result, effectiveModeText, { defaultTarget: plan.defaultTarget === true });
               activity.finish(sessionId, entry.id, "done", { phase: "", text });
               return text;
             } catch (error) {
