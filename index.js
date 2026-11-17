@@ -25,7 +25,7 @@ import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { mkdir, realpath, stat } from "node:fs/promises";
 import { relocateSession } from "./lib/relocate.js";
-import { BTW_SYSTEM_PROMPT, buildBriefPrompt, buildInstructionText, buildSideThread } from "./lib/prompts.js";
+import { BTW_SYSTEM_PROMPT, buildBriefPrompt, buildSideThread } from "./lib/prompts.js";
 import {
   askSideModel,
   buildTranscript,
@@ -654,24 +654,43 @@ export function apply(ctx) {
     return true;
   };
 
-  /** Cheap checks only: everything here must stay fast enough to run before returning. */
+  /**
+   * Cheap checks only: everything here must stay fast enough to run before
+   * returning. Returns `{ plan }` or `{ reason }` — a command that cannot run
+   * the side request says why instead of falling back to an agent turn, which
+   * would push the whole conversation through the model again (the exact way a
+   * saturated session dies at the egress fuse).
+   */
   const planSideHandoff = async ({ agent, sessionId, request, history }) => {
-    const registry = getService("workspaceRegistry");
     const llm = getService("llm");
-    if (registry === undefined || llm === undefined || typeof llm.stream !== "function") return undefined;
-    const session = agent?.session;
-    if (session === undefined) return undefined;
-    const route = resolveRoute(session);
-    if (typeof route.provider !== "string" || typeof route.model !== "string") return undefined;
+    if (llm === undefined || typeof llm.stream !== "function") {
+      return { reason: "宿主里没有可用的 llm 服务，侧路请求跑不起来。" };
+    }
+    const registry = getService("workspaceRegistry");
+    if (registry === undefined) return { reason: "宿主里没有 workspaceRegistry 服务。" };
     const target = await guessTarget(registry, request);
-    if (target === undefined) return undefined;
+    if (target === undefined) {
+      return {
+        reason: request.length === 0
+          ? `这条命令需要一个目标：/${history === "full" ? "handoff" : "handoff-summary"} ~/work/some-repo（后面可以再写一句简报重点）。`
+          : "认不出目标工作区：请写绝对路径（或 ~ 开头）、工作区标题、或工作区 id。"
+      };
+    }
+    const session = agent?.session;
+    if (session === undefined) return { reason: "拿不到当前会话。" };
+    const route = resolveRoute(session);
+    if (typeof route.provider !== "string" || typeof route.model !== "string") {
+      return { reason: "这次会话还没有请求记录，无法确定用哪个模型写简报。" };
+    }
     const messages = snapshotMessages(session);
-    if (countConversationMessages(messages) < 2) return undefined;
+    if (countConversationMessages(messages) < 2) {
+      return { reason: "这次会话还没有可交接的对话（至少需要一问一答）。" };
+    }
     // A handoff brief is worth a bigger window than a side question, but never
     // the whole session: providers reject structured replays and the bill is
     // not worth it. Flatten to text, newest messages first in the budget.
     const transcript = buildTranscript(messages, { maxChars: 400_000 });
-    if (transcript.text.length === 0) return undefined;
+    if (transcript.text.length === 0) return { reason: "这次会话没有可写进简报的文字内容。" };
     // Same refusal as the tool, but a command cannot ask a question: fall back
     // to the summary handoff and say why, rather than starting a copy that is
     // guaranteed to die on its first turn.
@@ -685,7 +704,7 @@ export function apply(ctx) {
         downgraded = true;
       }
     }
-    return { llm, session, route, target, transcript, history: effectiveHistory, downgraded };
+    return { plan: { llm, session, route, target, transcript, history: effectiveHistory, downgraded } };
   };
 
   const executeSideHandoff = async (plan, { agent, sessionId, request, signal, onBriefDelta, onPhase }) => {
@@ -829,73 +848,60 @@ export function apply(ctx) {
           `交接当前会话（${modeText}）到另一个工作区：用自然语言说明去哪、简报重点写什么`,
         input: { hint: "<自然语言：交接去哪里、简报重点>" },
         async handler(invocation) {
-          const { agent, rawInput, signal } = invocation;
+          const { agent, rawInput } = invocation;
           const request = String(rawInput ?? "").trim();
           const sessionId = agent?.session?.id ?? agent?.id;
-          const controller = getService("sessionController");
-          if (controller === undefined || typeof controller?.prompt !== "function" || typeof sessionId !== "string") {
-            return { kind: "error", text: "handoff: 会话控制器不可用，无法发起交接。" };
+          if (typeof sessionId !== "string") {
+            return { kind: "error", text: "handoff: 拿不到当前会话，无法发起交接。" };
           }
 
           // The side request uploads the whole conversation, so it must not run
           // inside the handler: the composer would hold the draft until it lands.
-          const plan = await planSideHandoff({ agent, sessionId, request, history });
-          if (plan !== undefined) {
-            const effectiveModeText = plan.downgraded === true ? "仅摘要（源会话过大，已自动降级）" : modeText;
-            const placeholder = `正在生成简报并交接（${effectiveModeText}）…`;
-            const entry = activity.begin(sessionId, {
-              kind: "handoff",
-              title: `交接简报（${effectiveModeText}）`,
-              phase: plan.downgraded === true ? "源会话已接近窗口上限，改用仅摘要…" : "正在写简报…",
-              target: plan.target
-            });
-            const scheduled = scheduleLateResult(invocation, placeholder, async (lateSignal) => {
-              try {
-                const { result } = await executeSideHandoff(plan, {
-                  agent,
-                  sessionId,
-                  request,
-                  signal: lateSignal,
-                  onBriefDelta: (text) => activity.update(sessionId, entry.id, { phase: "正在写简报…", text }),
-                  onPhase: (phase) => activity.update(sessionId, entry.id, { phase })
-                });
-                const text = describeHandoff(result, effectiveModeText);
-                activity.finish(sessionId, entry.id, "done", { phase: "", text });
-                return text;
-              } catch (error) {
-                activity.finish(sessionId, entry.id, "error", {
-                  phase: "",
-                  text: error instanceof Error ? error.message : String(error)
-                });
-                throw error;
-              }
-            }, {
-              onController: (controller) => activity.track(sessionId, controller),
-              failurePrefix: `交接失败（${effectiveModeText}）`
-            });
-            if (scheduled) return { kind: "success", text: `${placeholder}完成后会更新这条结果。` };
+          const planned = await planSideHandoff({ agent, sessionId, request, history });
+          if (planned.plan === undefined) {
+            return { kind: "error", text: `handoff：${planned.reason}` };
           }
-
-          try {
-            await controller.prompt(
-              {
-                requestId: randomUUID(),
+          const plan = planned.plan;
+          const effectiveModeText = plan.downgraded === true ? "仅摘要（源会话过大，已自动降级）" : modeText;
+          const placeholder = `正在生成简报并交接（${effectiveModeText}）…`;
+          const entry = activity.begin(sessionId, {
+            kind: "handoff",
+            title: `交接简报（${effectiveModeText}）`,
+            phase: plan.downgraded === true ? "源会话已接近窗口上限，改用仅摘要…" : "正在写简报…",
+            target: plan.target
+          });
+          const scheduled = scheduleLateResult(invocation, placeholder, async (lateSignal) => {
+            try {
+              const { result } = await executeSideHandoff(plan, {
+                agent,
                 sessionId,
-                mode: "queue",
-                content: [{ type: "text", text: buildInstructionText({ request, history }) }]
-              },
-              signal
-            );
+                request,
+                signal: lateSignal,
+                onBriefDelta: (text) => activity.update(sessionId, entry.id, { phase: "正在写简报…", text }),
+                onPhase: (phase) => activity.update(sessionId, entry.id, { phase })
+              });
+              const text = describeHandoff(result, effectiveModeText);
+              activity.finish(sessionId, entry.id, "done", { phase: "", text });
+              return text;
+            } catch (error) {
+              activity.finish(sessionId, entry.id, "error", {
+                phase: "",
+                text: error instanceof Error ? error.message : String(error)
+              });
+              throw error;
+            }
+          }, {
+            onController: (controller) => activity.track(sessionId, controller),
+            failurePrefix: `交接失败（${effectiveModeText}）`
+          });
+          if (scheduled) return { kind: "success", text: `${placeholder}完成后会更新这条结果。` };
+          // No command id: answer inline, accepting the wait.
+          try {
+            const { result } = await executeSideHandoff(plan, { agent, sessionId, request });
+            return { kind: "success", text: describeHandoff(result, effectiveModeText) };
           } catch (error) {
-            return {
-              kind: "error",
-              text: `handoff: 无法把交接请求交给 Agent：${error instanceof Error ? error.message : String(error)}`
-            };
+            return { kind: "error", text: `交接失败（${effectiveModeText}）：${formatFailure(error)}` };
           }
-          return {
-            kind: "success",
-            text: `已提交交接请求（${modeText}）。Agent 会先确定目标工作区、写好简报，再创建新会话。`
-          };
         }
       };
     };

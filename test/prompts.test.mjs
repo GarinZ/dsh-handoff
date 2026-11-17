@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { BRIEF_SECTIONS, BTW_SYSTEM_PROMPT, buildBriefPrompt, buildInstructionText } from "../lib/prompts.js";
+import { BRIEF_SECTIONS, BTW_SYSTEM_PROMPT, buildBriefPrompt } from "../lib/prompts.js";
 
 test("the skeleton is the fixed six sections, in order", () => {
   assert.deepEqual(BRIEF_SECTIONS, ["目标", "决策", "已完成", "剩余", "关键上下文", "下一步"]);
@@ -36,17 +36,6 @@ test("summary and full modes say different things about the transcript", () => {
 test("an empty request still asks for a complete brief", () => {
   const prompt = buildBriefPrompt({ request: "   ", history: "full" });
   assert.ok(prompt.includes("no extra request"));
-});
-
-test("the fallback instruction names the skeleton and the mode", () => {
-  const summary = buildInstructionText({ request: "去 ~/x", history: "summary" });
-  assert.ok(summary.includes("summary — 只写总结"));
-  assert.ok(summary.includes("## 目标"));
-  assert.ok(summary.includes("去 ~/x"));
-  assert.ok(summary.includes("自包含"));
-  const full = buildInstructionText({ request: "", history: "full" });
-  assert.ok(full.includes("full — 复制完整历史"));
-  assert.ok(full.includes("用户没有写具体要求"));
 });
 
 test("the btw system prompt keeps the observer read-only", () => {
