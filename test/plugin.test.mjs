@@ -103,20 +103,30 @@ test("a command with no argument hands off inside the current workspace", async 
   assert.equal(llm.calls.length, 1, "the side request writes the brief");
 });
 
-test("a description that names no readable target is still an error", async () => {
-  const host = makeHost({ llm: fakeLlm("unused"), workspaceRegistry: { list: () => [] } });
+test("a description that names no target still hands off inside the current workspace", async () => {
+  const llm = fakeLlm("## 目标\n- 电子书阅读 APP 的 worktree 分支");
+  const host = makeHost({ llm, workspaceRegistry: { list: () => [] } });
   apply(host.ctx);
   const session = fakeSession({ header: { cwd: "/tmp/current-ws" }, append: () => ({}) });
-  const result = await findCommand(host.commands, "handoff").handler({
+  const result = await findCommand(host.commands, "handoff-summary").handler({
     agent: { session },
-    rawInput: "交接给那个我们之前说过的仓库",
-    commandId: "cmd-bad",
+    rawInput: "接下来要做电子书阅读 APP，用 worktree 并行开发，总结一下前面的 SHA",
+    commandId: "cmd-focus-only",
     signal: undefined
   });
 
-  assert.equal(result.kind, "error");
-  assert.ok(result.text.includes("认不出目标工作区"), result.text);
+  assert.equal(result.kind, "success", "a focus-only description is not an error");
+  assert.ok(result.text.startsWith("正在生成简报并交接"), result.text);
   assert.equal(host.prompts.length, 0);
+  assert.equal(llm.calls.length, 1);
+
+  // The progress slot names the destination, which is how a wrong default
+  // becomes visible instead of silently blocking the command.
+  const route = host.routes.find((entry) => entry.path === "/handoff/activity");
+  const res = fakeResponse();
+  await route.handler({ method: "GET", url: `?session=${session.id}` }, res);
+  const slot = res.payload;
+  assert.equal(slot.target, "/tmp/current-ws");
 });
 
 test("the full command runs the side request once it has a path", async () => {

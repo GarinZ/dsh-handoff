@@ -671,19 +671,15 @@ export function apply(ctx) {
     const session = agent?.session;
     if (session === undefined) return { reason: "拿不到当前会话。" };
     const named = await guessTarget(registry, request);
-    // No description at all is not an error: the common zero-argument intent
-    // is "this conversation is full, give me a fresh one with a summary", and
-    // that fresh session belongs in the workspace we are already in. A
-    // description that names a target we cannot read is still an error — we do
-    // not silently ignore what the user typed.
-    const fallbackTarget = request.length === 0 ? session.header?.cwd : undefined;
+    // The trailing text is mostly about *what to write*, not *where to go*:
+    // "接下来要做 X，总结一下前面的 SHA" names no workspace at all. So an
+    // unresolvable description is not an error — it defaults to the workspace
+    // we are already in, and the card/result state the destination plainly so
+    // a wrong guess is visible in one glance instead of blocking the command.
+    const fallbackTarget = session.header?.cwd;
     const target = named ?? (typeof fallbackTarget === "string" && fallbackTarget.length > 0 ? fallbackTarget : undefined);
     if (target === undefined) {
-      return {
-        reason: request.length === 0
-          ? "拿不到当前工作区目录，没法默认交接回本工作区；请写目标（路径 / 标题 / id）。"
-          : "认不出目标工作区：请写绝对路径（或 ~ 开头）、工作区标题、或工作区 id。"
-      };
+      return { reason: "拿不到当前工作区目录：请写目标（绝对路径 / ~ 开头 / 工作区标题 / 工作区 id）。" };
     }
     const route = resolveRoute(session);
     if (typeof route.provider !== "string" || typeof route.model !== "string") {
@@ -845,7 +841,7 @@ export function apply(ctx) {
   const describeHandoff = (result, modeText, { defaultTarget = false } = {}) =>
     `已交接（${modeText}）：会话 ${result.sessionId} 位于工作区「${result.workspaceTitle}」(${result.workspacePath})` +
     (result.workspaceCreated === true ? "（新工作区）" : "") +
-    (defaultTarget ? "（没写目标，默认交接回当前工作区）" : "") +
+    (defaultTarget ? "（没认出目标工作区，已默认交接回当前工作区）" : "") +
     "。原会话保持不变。";
 
   const registerCommands = () => {
